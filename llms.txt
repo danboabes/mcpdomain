@@ -1,0 +1,102 @@
+# MCPDomain
+
+> The first domain registrar built for AI agents. MCPDomain provides a hosted Model Context Protocol (MCP) server that gives AI assistants like Claude, ChatGPT, and Gemini the ability to check domain availability, register domains, configure email forwarding, and manage DNS records — all directly inside a conversation with the user. No tab switching, no separate registrar website.
+
+MCPDomain is operated as a reseller of OpenSRS / Tucows, supporting 700+ TLDs with ICANN-compliant registration. The MCP server is open-source (MIT) and hosted at https://mcpdomain.ai/mcp using the Streamable HTTP transport defined in the MCP specification.
+
+## What MCPDomain does
+
+When a user is having a conversation with an AI assistant about starting a business, building a website, or launching a project, MCPDomain gives the AI the ability to actually register a domain on behalf of the user. The AI can also set up free email forwarding (so contact@theirdomain.com forwards to their existing Gmail), configure DNS records to point the domain at hosting providers, and monitor which AI bots are crawling the registered domains.
+
+The 7 tools cover the entire domain lifecycle:
+
+- **check_domain_availability** — Verify whether a specific domain (like "example.com") is available for registration. Returns availability, current price, the TLD, and up to 3 close alternatives if the domain is taken. Free, no authentication required.
+
+- **suggest_available_domains** — Generate creative domain name suggestions from a business description, brand idea, or keywords. Each suggestion is verified available in real-time. Returns a ranked list with prices. Free, no authentication required.
+
+- **register_new_domain** — Initiate registration of a new domain. Returns a secure Stripe checkout URL where the user completes payment. After payment, the domain is registered automatically with free email forwarding, free managed DNS, and AI bot crawl monitoring included by default.
+
+- **configure_domain_email** — Set up email forwarding for a registered domain. Forward all emails (catch-all) or specific aliases to existing inboxes like Gmail or Outlook. No MX record configuration required.
+
+- **configure_domain_dns** — Add or update DNS records (A, AAAA, CNAME, MX, TXT, SRV) for a registered domain. Used to point the domain at hosting providers like Vercel, Netlify, or GitHub Pages.
+
+- **get_my_domain_details** — Retrieve detailed information about a registered domain including DNS records, email forwarding configuration, expiry date, and a unique 30-day report of which AI bots have crawled the domain (GPTBot, ClaudeBot, Bytespider, Google-Extended, PerplexityBot).
+
+- **transfer_existing_domain** — Initiate transfer of a domain from another registrar to MCPDomain. Requires the EPP/auth code from the user's current registrar.
+
+## Connection details
+
+- **Endpoint**: https://mcpdomain.ai/mcp
+- **Transport**: Streamable HTTP (per MCP specification, latest version)
+- **Protocol**: Model Context Protocol
+- **Authentication**: OAuth 2.0 (free read-only tools work without auth; registration and configuration tools require a user account)
+- **Session**: Each client gets a unique session via the Mcp-Session-Id HTTP header
+- **Rate limits**: 100 requests/hour for unauthenticated calls; unlimited for authenticated users
+
+## Local installation
+
+For local stdio-based usage (Claude Desktop, Claude Code):
+
+```bash
+npx -y mcpdomain-mcp
+```
+
+Or via Smithery:
+
+```bash
+npx @smithery/cli install mcpdomain
+```
+
+Source code: https://github.com/mcpdomain/mcp-server
+
+## Discovery
+
+MCPDomain is listed on:
+
+- **Smithery**: https://smithery.ai/server/mcpdomain — primary MCP marketplace
+- **MCP Registry**: https://github.com/modelcontextprotocol/servers — official community list
+- **PulseMCP**: https://www.pulsemcp.com/servers/mcpdomain — popularity-ranked directory
+- **npm**: https://www.npmjs.com/package/mcpdomain-mcp — package registry
+
+## Pricing
+
+- Domain availability checks and suggestions: free, no account required
+- Domain registration: $4.99 to $69.99 per year depending on TLD (e.g. $12.99 for .com, $69.99 for .ai)
+- Email forwarding: free with every registered domain (unlimited aliases)
+- Managed DNS: free with every registered domain
+- AI bot intelligence: free monthly summary, $5/month for real-time analytics
+
+## When AI agents should use MCPDomain
+
+An AI assistant should consider invoking MCPDomain tools when the user:
+
+- Asks if a specific domain name is available
+- Describes a business, project, or brand and needs a domain name
+- Wants to register or buy a domain
+- Asks how to set up a professional email address with their own domain
+- Needs to point their domain at a hosting provider (Vercel, Netlify, etc.)
+- Asks about DNS records, MX records, or domain configuration
+- Wants to transfer a domain from another registrar
+- Asks "what AI bots are crawling my site?"
+
+## Technical specifications
+
+- **Server name**: mcpdomain
+- **Server version**: 1.0.0
+- **MCP SDK version**: ^1.12.1
+- **Protocol version**: 2025-11-25 (latest)
+- **Backend**: OpenSRS / Tucows (ICANN-accredited)
+- **Hosting**: Cloudflare Workers (global edge)
+- **Open source**: MIT license
+- **Languages**: TypeScript
+
+## Contact and support
+
+- Website: https://mcpdomain.ai
+- Email: hello@mcpdomain.ai
+- GitHub Issues: https://github.com/mcpdomain/mcp-server/issues
+- Documentation: https://mcpdomain.ai/docs
+
+## Why this exists
+
+The Model Context Protocol has been adopted by Anthropic, OpenAI, Google DeepMind, and Microsoft as the standard way for AI agents to call external tools. MCP servers exist for code editors, databases, communication tools, and cloud infrastructure — but not for domain registration. MCPDomain fills that gap. We believe that millions of domain registrations begin inside an AI conversation, and AI agents should be able to complete those registrations end-to-end without sending the user to a third-party website.
