@@ -1,0 +1,90 @@
+# Smithery configuration for MCPDomain
+# https://smithery.ai/docs/build/project-config
+
+version: 1
+name: mcpdomain
+displayName: MCPDomain
+description: The first domain registrar built for AI agents. Check availability, register domains, configure email forwarding, and manage DNS — all from inside any AI conversation.
+
+# Categories help discovery in Smithery's marketplace
+categories:
+  - infrastructure
+  - productivity
+  - developer-tools
+  - business
+
+# Tags for search
+tags:
+  - domain
+  - dns
+  - email
+  - registrar
+  - opensrs
+  - tucows
+  - email-forwarding
+  - domain-registration
+  - infrastructure
+
+# Repository
+repository: https://github.com/danboabes/mcpdomain
+homepage: https://mcpdomain.ai
+license: MIT
+author: MCPDomain
+
+# Installation method
+runtime: typescript
+
+# How Smithery should start the server
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      mode:
+        type: string
+        enum: ["mock", "live"]
+        default: "mock"
+        description: "Operation mode. 'mock' returns simulated data for testing. 'live' connects to OpenSRS for real domain operations (requires credentials)."
+      opensrsUsername:
+        type: string
+        description: "Your OpenSRS reseller username (only required in live mode)"
+      opensrsKey:
+        type: string
+        description: "Your OpenSRS API key (only required in live mode)"
+    required: []
+  commandFunction: |
+    (config) => ({
+      command: "npx",
+      args: ["-y", "mcpdomain-mcp"],
+      env: {
+        OPENSRS_MODE: config.mode || "mock",
+        OPENSRS_USERNAME: config.opensrsUsername || "",
+        OPENSRS_KEY: config.opensrsKey || ""
+      }
+    })
+
+# Tool listing for marketplace browse
+tools:
+  - name: check_domain_availability
+    description: Check whether a specific domain is available for registration. Returns price and alternatives if taken.
+  - name: suggest_available_domains
+    description: Generate creative domain name ideas from keywords with real-time availability checks.
+  - name: register_new_domain
+    description: Register a new domain. Returns checkout URL for payment via Stripe.
+  - name: configure_domain_email
+    description: Set up email forwarding (catch-all or aliases) to any inbox.
+  - name: configure_domain_dns
+    description: Add or update DNS records (A, CNAME, MX, TXT, etc).
+  - name: get_my_domain_details
+    description: Get domain status, DNS, email config, and AI bot crawling stats.
+  - name: transfer_existing_domain
+    description: Transfer a domain from another registrar to MCPDomain.
+
+# Example prompts that should trigger this server
+examples:
+  - "Is sweetcrumbs.com available?"
+  - "Help me find a domain for my new bakery business"
+  - "Register example.com and forward emails to my Gmail"
+  - "Point my domain at Vercel"
+  - "What AI bots have been crawling my site?"
+  - "Transfer my domain from GoDaddy to a better registrar"
