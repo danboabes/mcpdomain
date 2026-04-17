@@ -1,7 +1,7 @@
 {
   "name": "mcpdomain-mcp",
-  "version": "1.0.0",
-  "description": "MCPDomain MCP Server — The first domain registrar built for AI agents. Check availability, register domains, configure email forwarding and DNS, all from inside any AI conversation via Model Context Protocol.",
+  "version": "1.0.1",
+  "description": "MCPDomain MCP Server — The first domain registrar built for AI agents. Check availability, register domains, configure email forwarding and DNS, all from inside any AI conversation via Model Context Protocol. Zero runtime dependencies.",
   "type": "module",
   "main": "dist/stdio.js",
   "bin": {
@@ -15,10 +15,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/stdio.js",
-    "start:http": "node dist/http.js",
-    "dev": "tsx src/stdio.ts",
-    "dev:http": "tsx src/http.ts",
-    "test": "tsx src/test.ts"
+    "dev": "tsx src/stdio.ts"
   },
   "keywords": [
     "mcp",
@@ -44,10 +41,6 @@
   },
   "bugs": {
     "url": "https://github.com/danboabes/mcpdomain/issues"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "zod": "^3.24.4"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",

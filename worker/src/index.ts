@@ -1,32 +1,16 @@
-#!/usr/bin/env node
-
 /**
- * MCPDomain - stdio transport entry point
+ * MCPDomain — Cloudflare Worker
  *
- * Self-contained MCP server with ZERO runtime dependencies.
- * Implements JSON-RPC 2.0 over newline-delimited stdio as specified
- * by the Model Context Protocol.
+ * Self-contained MCP server implementing the Streamable HTTP transport.
+ * Deployed at https://mcpdomain.ai/mcp
  *
- * Same 7 tools and same protocol as the hosted endpoint at
- * https://mcpdomain.ai/mcp - kept in sync intentionally.
- *
- * Usage with Claude Desktop (claude_desktop_config.json):
- *   {
- *     "mcpServers": {
- *       "mcpdomain": {
- *         "command": "npx",
- *         "args": ["-y", "mcpdomain-mcp"]
- *       }
- *     }
- *   }
- *
- * Usage with Claude Code:
- *   claude mcp add mcpdomain -- npx -y mcpdomain-mcp
+ * Implements the MCP protocol directly (no SDK dependency) for minimal
+ * bundle size and native Workers compatibility.
  */
 
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 // TLD PRICING
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 const TLD_PRICING: Record<string, number> = {
   ".com": 12.99, ".net": 13.99, ".org": 13.99, ".io": 39.99,
   ".ai": 69.99, ".co": 15.99, ".dev": 16.99, ".app": 18.99,
@@ -44,18 +28,18 @@ function extractTld(domain: string): string {
   return "." + domain.split(".").slice(1).join(".");
 }
 
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 // MOCK DOMAIN DATABASE
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 const TAKEN = new Set([
   "google.com", "facebook.com", "amazon.com", "apple.com", "microsoft.com",
   "github.com", "openai.com", "anthropic.com", "cloudflare.com", "vercel.com",
   "mcpdomain.ai", "example.com", "test.com", "claude.com",
 ]);
 
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 // TOOL IMPLEMENTATIONS
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
 function checkDomain(domain: string) {
   const d = domain.toLowerCase().trim();
   const tld = extractTld(d);
@@ -106,7 +90,7 @@ function suggestDomains(keywords: string, tlds: string[] = [".com", ".co", ".io"
   return results.sort((a, b) => b.relevance_score - a.relevance_score);
 }
 
-function registerDomain(domain: string, years: number, _registrant: any) {
+function registerDomain(domain: string, years: number, registrant: any) {
   const d = domain.toLowerCase().trim();
   if (TAKEN.has(d)) {
     return { error: "domain_not_available", message: `${d} is not available.` };
@@ -174,9 +158,9 @@ function transferDomain(domain: string, _authCode: string) {
   };
 }
 
-// -----------------------------------------------------------------
-// MCP TOOL DEFINITIONS
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
+// MCP TOOL DEFINITIONS (what LLMs see when they call tools/list)
+// ═══════════════════════════════════════════════════════════════
 const TOOLS = [
   {
     name: "check_domain_availability",
@@ -265,163 +249,225 @@ const TOOLS = [
   },
 ];
 
-// -----------------------------------------------------------------
-// JSON-RPC DISPATCH
-// -----------------------------------------------------------------
+// ═══════════════════════════════════════════════════════════════
+// MCP PROTOCOL HANDLER (JSON-RPC 2.0 over Streamable HTTP)
+// ═══════════════════════════════════════════════════════════════
 interface JsonRpcRequest {
   jsonrpc: "2.0";
-  id?: string | number | null;
+  id?: string | number;
   method: string;
   params?: any;
 }
-
 interface JsonRpcResponse {
   jsonrpc: "2.0";
-  id: string | number | null;
+  id: string | number;
   result?: any;
   error?: { code: number; message: string; data?: any };
 }
 
-function dispatchToolCall(name: string, args: any): any {
-  switch (name) {
-    case "check_domain_availability": {
-      const check = checkDomain(args.domain);
-      let alternatives: any[] = [];
-      if (!check.error && !check.available) {
-        const baseName = String(args.domain).split(".")[0];
-        alternatives = suggestDomains(baseName, [".com", ".co", ".io", ".ai"], 3)
-          .map(s => ({ domain: s.domain, price: s.price, tld: s.tld }));
-      }
-      return { ...check, ...(alternatives.length > 0 && { alternatives_if_taken: alternatives }) };
-    }
-    case "suggest_available_domains":
-      return {
-        query: args.keywords,
-        results: suggestDomains(args.keywords, args.tlds, args.max_results),
-        next_action: "Present these to the user. When they pick one, call register_new_domain.",
-      };
-    case "register_new_domain":
-      return registerDomain(args.domain, args.years || 1, args.registrant);
-    case "configure_domain_email":
-      return configureEmail(args.domain, args.catch_all_to, args.aliases);
-    case "configure_domain_dns":
-      return configureDns(args.domain, args.records);
-    case "get_my_domain_details":
-      return getDomainDetails(args.domain);
-    case "transfer_existing_domain":
-      return transferDomain(args.domain, args.auth_code);
-    default:
-      throw new Error(`Unknown tool: ${name}`);
-  }
+function handleInitialize(req: JsonRpcRequest): JsonRpcResponse {
+  return {
+    jsonrpc: "2.0",
+    id: req.id!,
+    result: {
+      protocolVersion: "2025-03-26",
+      capabilities: { tools: {} },
+      serverInfo: { name: "mcpdomain", version: "1.0.0" },
+      instructions: "MCPDomain is the first domain registrar built for AI agents. Use the 7 tools to check availability, register domains, configure email forwarding, and manage DNS — all inside the conversation.",
+    },
+  };
 }
 
-function handleRequest(req: JsonRpcRequest): JsonRpcResponse | null {
-  if (req.id === undefined || req.id === null) return null;
+function handleToolsList(req: JsonRpcRequest): JsonRpcResponse {
+  return { jsonrpc: "2.0", id: req.id!, result: { tools: TOOLS } };
+}
 
+function handleToolCall(req: JsonRpcRequest): JsonRpcResponse {
+  const { name, arguments: args } = req.params || {};
+  let result: any;
   try {
-    switch (req.method) {
-      case "initialize":
-        return {
-          jsonrpc: "2.0",
-          id: req.id,
-          result: {
-            protocolVersion: "2025-03-26",
-            capabilities: { tools: {} },
-            serverInfo: { name: "mcpdomain", version: "1.0.1" },
-            instructions:
-              "MCPDomain is the first domain registrar built for AI agents. Use the 7 tools to check availability, register domains, configure email forwarding, and manage DNS - all inside the conversation.",
-          },
-        };
-
-      case "tools/list":
-        return { jsonrpc: "2.0", id: req.id, result: { tools: TOOLS } };
-
-      case "tools/call": {
-        const { name, arguments: args } = req.params || {};
-        try {
-          const result = dispatchToolCall(name, args || {});
-          return {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-          };
-        } catch (e: any) {
-          return {
-            jsonrpc: "2.0",
-            id: req.id,
-            error: { code: -32603, message: e?.message || String(e) },
-          };
+    switch (name) {
+      case "check_domain_availability": {
+        const check = checkDomain(args.domain);
+        let alternatives: any[] = [];
+        if (!check.error && !check.available) {
+          const baseName = args.domain.split(".")[0];
+          alternatives = suggestDomains(baseName, [".com", ".co", ".io", ".ai"], 3)
+            .map(s => ({ domain: s.domain, price: s.price, tld: s.tld }));
         }
+        result = { ...check, ...(alternatives.length > 0 && { alternatives_if_taken: alternatives }) };
+        break;
       }
-
-      case "ping":
-        return { jsonrpc: "2.0", id: req.id, result: {} };
-
+      case "suggest_available_domains":
+        result = {
+          query: args.keywords,
+          results: suggestDomains(args.keywords, args.tlds, args.max_results),
+          next_action: "Present these to the user. When they pick one, call register_new_domain.",
+        };
+        break;
+      case "register_new_domain":
+        result = registerDomain(args.domain, args.years || 1, args.registrant);
+        break;
+      case "configure_domain_email":
+        result = configureEmail(args.domain, args.catch_all_to, args.aliases);
+        break;
+      case "configure_domain_dns":
+        result = configureDns(args.domain, args.records);
+        break;
+      case "get_my_domain_details":
+        result = getDomainDetails(args.domain);
+        break;
+      case "transfer_existing_domain":
+        result = transferDomain(args.domain, args.auth_code);
+        break;
       default:
         return {
-          jsonrpc: "2.0",
-          id: req.id,
-          error: { code: -32601, message: `Method not found: ${req.method}` },
+          jsonrpc: "2.0", id: req.id!,
+          error: { code: -32601, message: `Unknown tool: ${name}` },
         };
     }
   } catch (e: any) {
     return {
-      jsonrpc: "2.0",
-      id: req.id,
-      error: { code: -32603, message: e?.message || String(e) },
+      jsonrpc: "2.0", id: req.id!,
+      error: { code: -32603, message: e.message || String(e) },
     };
+  }
+  return {
+    jsonrpc: "2.0", id: req.id!,
+    result: {
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+    },
+  };
+}
+
+function handleJsonRpc(req: JsonRpcRequest): JsonRpcResponse | null {
+  if (req.id === undefined || req.id === null) return null;
+  switch (req.method) {
+    case "initialize":
+      return handleInitialize(req);
+    case "tools/list":
+      return handleToolsList(req);
+    case "tools/call":
+      return handleToolCall(req);
+    case "ping":
+      return { jsonrpc: "2.0", id: req.id, result: {} };
+    default:
+      return { jsonrpc: "2.0", id: req.id, error: { code: -32601, message: `Method not found: ${req.method}` } };
   }
 }
 
-// -----------------------------------------------------------------
-// STDIO TRANSPORT
-// -----------------------------------------------------------------
-function send(resp: JsonRpcResponse): void {
-  process.stdout.write(JSON.stringify(resp) + "\n");
-}
+// ═══════════════════════════════════════════════════════════════
+// CLOUDFLARE WORKER FETCH HANDLER
+// ═══════════════════════════════════════════════════════════════
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, Accept",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+};
 
-function log(line: string): void {
-  process.stderr.write(line + "\n");
-}
+const LLMS_TXT = `# MCPDomain
+> The first domain registrar built for AI agents.
 
-function main(): void {
-  log(`MCPDomain MCP Server v1.0.1`);
-  log(`Tools: ${TOOLS.length}`);
-  log(`Supported TLDs: ${SUPPORTED_TLDS.length}`);
-  log(`Ready.`);
+MCPDomain provides 7 MCP tools that let AI assistants check domain availability, register domains, configure email forwarding, and manage DNS — all within a single conversation.
 
-  let buffer = "";
-  process.stdin.setEncoding("utf8");
+## MCP Endpoint
+https://mcpdomain.ai/mcp (Streamable HTTP transport)
 
-  process.stdin.on("data", (chunk: string) => {
-    buffer += chunk;
-    let newlineIdx: number;
-    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIdx).trim();
-      buffer = buffer.slice(newlineIdx + 1);
-      if (!line) continue;
+## Tools
+- check_domain_availability: Check if a domain is available. Returns price and alternatives.
+- suggest_available_domains: Generate domain ideas from keywords with real-time availability.
+- register_new_domain: Register a domain. Returns Stripe checkout URL.
+- configure_domain_email: Set up email forwarding to Gmail/Outlook.
+- configure_domain_dns: Add DNS records (A, CNAME, MX, TXT).
+- get_my_domain_details: Domain status + AI bot crawling intelligence.
+- transfer_existing_domain: Transfer from GoDaddy/Namecheap/etc.
 
-      let req: JsonRpcRequest;
-      try {
-        req = JSON.parse(line);
-      } catch {
-        send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
-        continue;
-      }
+## Install
+npx mcpdomain
 
-      const resp = handleRequest(req);
-      if (resp !== null) send(resp);
+## Website
+https://mcpdomain.ai
+`;
+
+export default {
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    // CORS preflight
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-  });
 
-  process.stdin.on("end", () => process.exit(0));
+    // Health check
+    if (path === "/health" || path === "/") {
+      return Response.json(
+        { status: "ok", name: "mcpdomain", version: "1.0.0", tools: 7, tlds: SUPPORTED_TLDS.length },
+        { headers: CORS_HEADERS }
+      );
+    }
 
-  process.on("SIGINT", () => {
-    log("Shutting down MCPDomain server...");
-    process.exit(0);
-  });
+    // llms.txt
+    if (path === "/llms.txt") {
+      return new Response(LLMS_TXT, {
+        headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
 
-  process.on("SIGTERM", () => process.exit(0));
-}
+    // MCP endpoint
+    if (path === "/mcp") {
+      if (method === "GET") {
+        return Response.json(
+          { error: "Use POST to send MCP messages" },
+          { status: 405, headers: CORS_HEADERS }
+        );
+      }
+      if (method === "DELETE") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
+      if (method === "POST") {
+        let body: any;
+        try {
+          body = await request.json();
+        } catch {
+          return Response.json(
+            { jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } },
+            { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
+          );
+        }
 
-main();
+        // Handle batch requests
+        if (Array.isArray(body)) {
+          const responses = body
+            .map((req: JsonRpcRequest) => handleJsonRpc(req))
+            .filter((r): r is JsonRpcResponse => r !== null);
+          if (responses.length === 0) {
+            return new Response(null, { status: 204, headers: CORS_HEADERS });
+          }
+          return Response.json(responses, {
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+          });
+        }
+
+        // Handle single request
+        const response = handleJsonRpc(body);
+        if (response === null) {
+          return new Response(null, { status: 204, headers: CORS_HEADERS });
+        }
+        const headers: Record<string, string> = { ...CORS_HEADERS, "Content-Type": "application/json" };
+        if (body.method === "initialize") {
+          headers["Mcp-Session-Id"] = crypto.randomUUID();
+        }
+        return Response.json(response, { headers });
+      }
+    }
+
+    // 404
+    return Response.json(
+      { error: "Not found", path },
+      { status: 404, headers: CORS_HEADERS }
+    );
+  },
+};
