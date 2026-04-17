@@ -1,11 +1,11 @@
 {
-  "name": "mcpdomain-mcp",
+  "name": "mcpdomain",
   "version": "1.0.2",
   "description": "MCPDomain MCP Server — The first domain registrar built for AI agents. Check availability, register domains, configure email forwarding and DNS, all from inside any AI conversation via Model Context Protocol. Zero runtime dependencies.",
   "type": "module",
   "main": "dist/stdio.js",
   "bin": {
-    "mcpdomain-mcp": "dist/stdio.js"
+    "mcpdomain": "dist/stdio.js"
   },
   "files": [
     "dist",

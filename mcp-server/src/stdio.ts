@@ -15,13 +15,13 @@
  *     "mcpServers": {
  *       "mcpdomain": {
  *         "command": "npx",
- *         "args": ["-y", "mcpdomain-mcp"]
+ *         "args": ["-y", "mcpdomain"]
  *       }
  *     }
  *   }
  *
  * Usage with Claude Code:
- *   claude mcp add mcpdomain -- npx -y mcpdomain-mcp
+ *   claude mcp add mcpdomain -- npx -y mcpdomain
  */
 
 // -----------------------------------------------------------------
