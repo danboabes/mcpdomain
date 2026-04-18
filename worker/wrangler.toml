@@ -7,10 +7,16 @@ compatibility_date = "2025-04-01"
 workers_dev = true
 
 # Routes for mcpdomain.ai/mcp are configured via the Cloudflare Dashboard
-# (Workers & Pages → mcpdomain-mcp → Settings → Domains & Routes) because
+# (Workers & Pages -> mcpdomain-mcp -> Settings -> Domains & Routes) because
 # the current CLOUDFLARE_API_TOKEN does not have zone-edit permission for
 # mcpdomain.ai. If you later create a token with "Zone.Workers Routes: Edit"
 # on mcpdomain.ai, you can move the routes back into this file.
 
 [observability]
 enabled = true
+
+# D1 database for persisting orders
+[[d1_databases]]
+binding = "DB"
+database_name = "mcpdomain-orders"
+database_id = "2db4e0ba-1792-4bf2-9a65-0a11e6a22857"
