@@ -38,7 +38,7 @@ The 7 tools cover the entire domain lifecycle:
 For local stdio-based usage (Claude Desktop, Claude Code):
 
 ```bash
-npx -y mcpdomain-mcp
+npx -y mcpdomain
 ```
 
 Or via Smithery:
@@ -56,7 +56,7 @@ MCPDomain is listed on:
 - **Smithery**: https://smithery.ai/server/mcpdomain — primary MCP marketplace
 - **MCP Registry**: https://github.com/modelcontextprotocol/servers — official community list
 - **PulseMCP**: https://www.pulsemcp.com/servers/mcpdomain — popularity-ranked directory
-- **npm**: https://www.npmjs.com/package/mcpdomain-mcp — package registry
+- **npm**: https://www.npmjs.com/package/mcpdomain — package registry
 
 ## Pricing
 
