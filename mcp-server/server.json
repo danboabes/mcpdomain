@@ -1,59 +1,43 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-11-25/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.danboabes/mcpdomain",
-  "description": "The first domain registrar built for AI agents. Check availability, suggest names, register domains, configure email forwarding, and manage DNS — all through MCP tools that AI assistants can call directly inside conversations.",
-  "version": "1.0.5",
   "title": "MCPDomain",
-  "homepage": "https://mcpdomain.ai",
-  "license": "MIT",
+  "description": "Buy & manage domains from any AI chat: availability, register, DNS, email forwarding, AI bot stats.",
+  "websiteUrl": "https://mcpdomain.ai",
   "repository": {
     "url": "https://github.com/danboabes/mcpdomain",
     "source": "github"
   },
-  "categories": [
-    "infrastructure",
-    "developer-tools",
-    "productivity",
-    "business"
-  ],
-  "tags": [
-    "domain",
-    "registrar",
-    "dns",
-    "email",
-    "email-forwarding",
-    "opensrs",
-    "tucows",
-    "domain-registration",
-    "icann"
-  ],
+  "version": "1.0.6",
   "packages": [
     {
-      "registryName": "npm",
-      "name": "mcpdomain",
-      "version": "1.0.5",
-      "runtimeHint": "node",
+      "registryType": "npm",
+      "identifier": "mcpdomain",
+      "version": "1.0.6",
+      "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
       },
-      "packageArguments": [],
       "environmentVariables": [
         {
           "name": "OPENSRS_MODE",
-          "description": "Operation mode: 'mock' for testing (default) or 'live' for real OpenSRS API calls",
-          "required": false,
+          "description": "Operation mode: 'mock' for testing (default) or 'live' for real OpenSRS API calls.",
+          "format": "string",
+          "isRequired": false,
           "default": "mock"
         },
         {
           "name": "OPENSRS_USERNAME",
-          "description": "OpenSRS reseller username (only required in live mode)",
-          "required": false,
+          "description": "OpenSRS reseller username (only required in live mode).",
+          "format": "string",
+          "isRequired": false,
           "isSecret": true
         },
         {
           "name": "OPENSRS_KEY",
-          "description": "OpenSRS API key (only required in live mode)",
-          "required": false,
+          "description": "OpenSRS API key (only required in live mode).",
+          "format": "string",
+          "isRequired": false,
           "isSecret": true
         }
       ]
@@ -61,41 +45,8 @@
   ],
   "remotes": [
     {
-      "transport": {
-        "type": "streamable-http"
-      },
-      "url": "https://mcpdomain.ai/mcp",
-      "description": "Hosted MCPDomain MCP server. No installation required — connect any MCP-compatible client directly. Free for read-only tools (check_domain_availability, suggest_available_domains). Authenticated tools require an MCPDomain account."
-    }
-  ],
-  "tools": [
-    {
-      "name": "check_domain_availability",
-      "description": "Check whether a specific internet domain (like 'example.com') is available for registration. Returns availability status, registration price, the TLD, and up to 3 close alternatives if the domain is taken. Free, no authentication required."
-    },
-    {
-      "name": "suggest_available_domains",
-      "description": "Generate creative domain name suggestions from a business description, brand idea, or keywords, then verify each suggestion is available in real-time. Returns a ranked list of available domains with prices. Free, no authentication required."
-    },
-    {
-      "name": "register_new_domain",
-      "description": "Initiate registration of a new domain on behalf of the user. Returns a Stripe checkout URL for payment. After payment, the domain is registered with free email forwarding, free DNS, and AI bot monitoring included."
-    },
-    {
-      "name": "configure_domain_email",
-      "description": "Set up email forwarding for a registered domain. Forward all emails (catch-all) or specific aliases (sales@, support@) to existing inboxes like Gmail or Outlook. No MX record configuration needed."
-    },
-    {
-      "name": "configure_domain_dns",
-      "description": "Add or update DNS records (A, AAAA, CNAME, MX, TXT, SRV) for a registered domain. Use to point the domain at hosting providers or set up third-party verifications."
-    },
-    {
-      "name": "get_my_domain_details",
-      "description": "Retrieve detailed information about a registered domain: status, DNS records, email forwards, expiry, and a unique 30-day report of which AI bots crawled the domain."
-    },
-    {
-      "name": "transfer_existing_domain",
-      "description": "Initiate the transfer of a domain from another registrar (GoDaddy, Namecheap, etc.) to MCPDomain. Requires the EPP authorization code from the current registrar."
+      "type": "streamable-http",
+      "url": "https://mcpdomain.ai/mcp"
     }
   ]
 }
