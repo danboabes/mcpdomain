@@ -8,12 +8,12 @@
     "url": "https://github.com/danboabes/mcpdomain",
     "source": "github"
   },
-  "version": "1.0.6",
+  "version": "1.0.7",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "mcpdomain",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
