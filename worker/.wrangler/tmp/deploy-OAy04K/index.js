@@ -1,71 +1,417 @@
-/**
- * MCPDomain - Cloudflare Worker
- *
- * Self-contained MCP server implementing the Streamable HTTP transport.
- * Deployed at https://mcpdomain.ai/mcp
- *
- * Routes:
- *   POST /mcp                          - MCP JSON-RPC endpoint (7 tools)
- *   GET  /health                       - health check
- *   GET  /llms.txt                     - AI-readable site description
- *   GET  /checkout/:orderId            - HTML checkout page for a pending order
- *   POST /api/checkout-session/:orderId - Create Stripe Checkout Session + 303 redirect
- *   POST /api/stripe-webhook           - Stripe event receiver (checkout.session.completed)
- *
- * Persistence: Cloudflare D1 binding env.DB (database: mcpdomain-orders)
- * Secrets: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
- *          OPENSRS_USERNAME, OPENSRS_KEY, REGISTRAR (via wrangler secret put)
- */
+var __defProp = Object.defineProperty;
+var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
-import { makeRegistrar } from "./registrars";
-
-// -----------------------------------------------------------------
-// WORKER ENV BINDINGS (defined in wrangler.toml)
-// -----------------------------------------------------------------
-interface Env {
-  DB: D1Database;
-  STRIPE_SECRET_KEY: string;
-  STRIPE_WEBHOOK_SECRET?: string;
-  // Registrar bindings — set via `wrangler secret put`.
-  REGISTRAR?: string;          // "opensrs" (default)
-  OPENSRS_USERNAME?: string;
-  OPENSRS_KEY?: string;
-  OPENSRS_ENV?: string;        // "live" (default) | "ote"
-}
-
-// -----------------------------------------------------------------
-// TLD PRICING
-// -----------------------------------------------------------------
-const TLD_PRICING: Record<string, number> = {
-  ".com": 12.99, ".net": 13.99, ".org": 13.99, ".io": 39.99,
-  ".ai": 69.99, ".co": 15.99, ".dev": 16.99, ".app": 18.99,
-  ".me": 12.99, ".xyz": 4.99, ".tech": 9.99, ".store": 8.99,
-  ".online": 7.99, ".site": 6.99, ".ro": 17.99, ".eu": 9.99,
-  ".uk": 10.99, ".de": 9.99,
+// src/registrars/opensrs.ts
+var ENDPOINTS = {
+  live: "https://rr-n1-tor.opensrs.net:55443/",
+  ote: "https://horizon.opensrs.net:55443/"
 };
-const SUPPORTED_TLDS = Object.keys(TLD_PRICING);
+var OpenSRSRegistrar = class {
+  constructor(config) {
+    this.config = config;
+    this.endpoint = ENDPOINTS[config.env ?? "live"];
+  }
+  static {
+    __name(this, "OpenSRSRegistrar");
+  }
+  name = "opensrs";
+  endpoint;
+  // ---------------------------------------------------------------
+  // PUBLIC API
+  // ---------------------------------------------------------------
+  async checkAvailability(domain) {
+    const xml = buildEnvelope("LOOKUP", "DOMAIN", { domain });
+    const resp = await this.send(xml);
+    const code = resp.items.response_code;
+    const status = resp.items.status;
+    return {
+      domain,
+      available: code === "210" || status === "available",
+      raw: resp.raw
+    };
+  }
+  async registerDomain(input) {
+    const contact = this.mergeContact(input.registrant);
+    const contactXml = renderContactSet(contact);
+    const nsXml = renderNameservers(input.nameservers);
+    const attributes = `
+      <item key="domain">${escapeXml(input.domain)}</item>
+      <item key="period">${Number(input.years) || 1}</item>
+      <item key="reg_type">new</item>
+      <item key="handle">process</item>
+      <item key="auto_renew">${input.auto_renew === false ? "0" : "1"}</item>
+      <item key="f_whois_privacy">${input.privacy === false ? "0" : "1"}</item>
+      <item key="f_lock_domain">1</item>
+      <item key="reg_username">${escapeXml(this.config.username)}</item>
+      <item key="reg_password">${escapeXml(generatePassword())}</item>
+      ${contactXml}
+      ${nsXml}
+    `;
+    const xml = buildEnvelopeRaw("SW_REGISTER", "DOMAIN", attributes);
+    const resp = await this.send(xml);
+    const ok = resp.items.is_success === "1" || resp.items.response_code === "200";
+    if (!ok) {
+      return {
+        ok: false,
+        domain: input.domain,
+        error_code: resp.items.response_code,
+        error_message: resp.items.response_text,
+        raw: resp.raw
+      };
+    }
+    return {
+      ok: true,
+      domain: input.domain,
+      registrar_order_id: resp.items.id || resp.items.order_id,
+      expires_at: resp.items["registration expiration date"] || resp.items.expiredate,
+      raw: resp.raw
+    };
+  }
+  async getDomainInfo(domain) {
+    const attributes = `
+      <item key="domain">${escapeXml(domain)}</item>
+      <item key="type">all_info</item>
+    `;
+    const xml = buildEnvelopeRaw("GET", "DOMAIN", attributes);
+    const resp = await this.send(xml);
+    const ok = resp.items.is_success === "1" || resp.items.response_code === "200";
+    if (!ok) {
+      return {
+        ok: false,
+        domain,
+        error_code: resp.items.response_code,
+        error_message: resp.items.response_text,
+        raw: resp.raw
+      };
+    }
+    return {
+      ok: true,
+      domain,
+      status: resp.items.sponsoring_rsp === "1" ? "active" : resp.items.status,
+      expires_at: resp.items.expiredate,
+      nameservers: resp.nameservers,
+      auto_renew: resp.items.auto_renew === "1",
+      raw: resp.raw
+    };
+  }
+  // ---------------------------------------------------------------
+  // INTERNALS
+  // ---------------------------------------------------------------
+  async send(xml) {
+    const signature = md5(md5(xml + this.config.key) + this.config.key);
+    const resp = await fetch(this.endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/xml",
+        "X-Username": this.config.username,
+        "X-Signature": signature,
+        "Accept": "text/xml"
+      },
+      body: xml
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      throw new Error(`OpenSRS HTTP ${resp.status}: ${text.slice(0, 500)}`);
+    }
+    return parseResponse(text);
+  }
+  mergeContact(c) {
+    const def = this.config.defaultContact ?? {};
+    return {
+      first_name: c.first_name,
+      last_name: c.last_name,
+      email: c.email,
+      phone: c.phone ?? def.phone ?? "+1.4165350123",
+      org_name: c.org_name ?? def.org_name ?? "MCPDomain",
+      address1: c.address1 ?? def.address1 ?? "96 Mowat Avenue",
+      address2: c.address2 ?? def.address2 ?? "",
+      city: c.city ?? def.city ?? "Toronto",
+      state: c.state ?? def.state ?? "ON",
+      postal_code: c.postal_code ?? def.postal_code ?? "M6K3M1",
+      country: c.country ?? def.country ?? "CA"
+    };
+  }
+};
+function buildEnvelope(action, object, attrs) {
+  const attributes = Object.entries(attrs).map(([k, v]) => `<item key="${k}">${escapeXml(String(v))}</item>`).join("\n          ");
+  return buildEnvelopeRaw(action, object, attributes);
+}
+__name(buildEnvelope, "buildEnvelope");
+function buildEnvelopeRaw(action, object, attributesXml) {
+  return `<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<!DOCTYPE OPS_envelope SYSTEM 'ops.dtd'>
+<OPS_envelope>
+  <header><version>0.9</version></header>
+  <body>
+    <data_block>
+      <dt_assoc>
+        <item key="protocol">XCP</item>
+        <item key="action">${action}</item>
+        <item key="object">${object}</item>
+        <item key="attributes">
+          <dt_assoc>
+${attributesXml}
+          </dt_assoc>
+        </item>
+      </dt_assoc>
+    </data_block>
+  </body>
+</OPS_envelope>`;
+}
+__name(buildEnvelopeRaw, "buildEnvelopeRaw");
+function renderContactSet(c) {
+  const one = `
+        <dt_assoc>
+          <item key="first_name">${escapeXml(c.first_name)}</item>
+          <item key="last_name">${escapeXml(c.last_name)}</item>
+          <item key="org_name">${escapeXml(c.org_name ?? "")}</item>
+          <item key="address1">${escapeXml(c.address1 ?? "")}</item>
+          <item key="address2">${escapeXml(c.address2 ?? "")}</item>
+          <item key="city">${escapeXml(c.city ?? "")}</item>
+          <item key="state">${escapeXml(c.state ?? "")}</item>
+          <item key="postal_code">${escapeXml(c.postal_code ?? "")}</item>
+          <item key="country">${escapeXml(c.country ?? "")}</item>
+          <item key="email">${escapeXml(c.email)}</item>
+          <item key="phone">${escapeXml(c.phone ?? "")}</item>
+        </dt_assoc>`;
+  return `<item key="contact_set">
+        <dt_assoc>
+          <item key="owner">${one}</item>
+          <item key="admin">${one}</item>
+          <item key="billing">${one}</item>
+          <item key="tech">${one}</item>
+        </dt_assoc>
+      </item>`;
+}
+__name(renderContactSet, "renderContactSet");
+function renderNameservers(ns) {
+  const list = ns && ns.length ? ns : [
+    "ns1.systemdns.com",
+    "ns2.systemdns.com",
+    "ns3.systemdns.com"
+  ];
+  const items = list.map((name, i) => `
+            <item key="${i}">
+              <dt_assoc>
+                <item key="sortorder">${i + 1}</item>
+                <item key="name">${escapeXml(name)}</item>
+              </dt_assoc>
+            </item>`).join("");
+  return `<item key="custom_nameservers">1</item>
+      <item key="custom_tech_contact">1</item>
+      <item key="nameserver_list">
+        <dt_array>${items}
+        </dt_array>
+      </item>`;
+}
+__name(renderNameservers, "renderNameservers");
+function escapeXml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+__name(escapeXml, "escapeXml");
+function generatePassword() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(generatePassword, "generatePassword");
+function parseResponse(xml) {
+  const items = {};
+  const topRegex = /<item key="([^"]+)">([^<]*)<\/item>/g;
+  let m;
+  while ((m = topRegex.exec(xml)) !== null) {
+    if (!(m[1] in items)) items[m[1]] = decodeXmlEntities(m[2]);
+  }
+  const nsMatches = [];
+  const nsRegex = /<dt_assoc>\s*<item key="sortorder">\d+<\/item>\s*<item key="name">([^<]+)<\/item>\s*<\/dt_assoc>/g;
+  while ((m = nsRegex.exec(xml)) !== null) nsMatches.push(decodeXmlEntities(m[1]));
+  return { items, nameservers: nsMatches.length ? nsMatches : void 0, raw: xml };
+}
+__name(parseResponse, "parseResponse");
+function decodeXmlEntities(s) {
+  return s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
+}
+__name(decodeXmlEntities, "decodeXmlEntities");
+function md5(s) {
+  const bytes = new TextEncoder().encode(s);
+  const words = [];
+  const len = bytes.length;
+  for (let i = 0; i < len; i++) {
+    words[i >> 2] = (words[i >> 2] || 0) | bytes[i] << i % 4 * 8;
+  }
+  words[len >> 2] = (words[len >> 2] || 0) | 128 << len % 4 * 8;
+  words[((len + 8 >>> 6) + 1) * 16 - 2] = len * 8;
+  let a = 1732584193, b = -271733879, c = -1732584194, d = 271733878;
+  for (let i = 0; i < words.length; i += 16) {
+    const oa = a, ob = b, oc = c, od = d;
+    a = ff(a, b, c, d, words[i + 0] | 0, 7, -680876936);
+    d = ff(d, a, b, c, words[i + 1] | 0, 12, -389564586);
+    c = ff(c, d, a, b, words[i + 2] | 0, 17, 606105819);
+    b = ff(b, c, d, a, words[i + 3] | 0, 22, -1044525330);
+    a = ff(a, b, c, d, words[i + 4] | 0, 7, -176418897);
+    d = ff(d, a, b, c, words[i + 5] | 0, 12, 1200080426);
+    c = ff(c, d, a, b, words[i + 6] | 0, 17, -1473231341);
+    b = ff(b, c, d, a, words[i + 7] | 0, 22, -45705983);
+    a = ff(a, b, c, d, words[i + 8] | 0, 7, 1770035416);
+    d = ff(d, a, b, c, words[i + 9] | 0, 12, -1958414417);
+    c = ff(c, d, a, b, words[i + 10] | 0, 17, -42063);
+    b = ff(b, c, d, a, words[i + 11] | 0, 22, -1990404162);
+    a = ff(a, b, c, d, words[i + 12] | 0, 7, 1804603682);
+    d = ff(d, a, b, c, words[i + 13] | 0, 12, -40341101);
+    c = ff(c, d, a, b, words[i + 14] | 0, 17, -1502002290);
+    b = ff(b, c, d, a, words[i + 15] | 0, 22, 1236535329);
+    a = gg(a, b, c, d, words[i + 1] | 0, 5, -165796510);
+    d = gg(d, a, b, c, words[i + 6] | 0, 9, -1069501632);
+    c = gg(c, d, a, b, words[i + 11] | 0, 14, 643717713);
+    b = gg(b, c, d, a, words[i + 0] | 0, 20, -373897302);
+    a = gg(a, b, c, d, words[i + 5] | 0, 5, -701558691);
+    d = gg(d, a, b, c, words[i + 10] | 0, 9, 38016083);
+    c = gg(c, d, a, b, words[i + 15] | 0, 14, -660478335);
+    b = gg(b, c, d, a, words[i + 4] | 0, 20, -405537848);
+    a = gg(a, b, c, d, words[i + 9] | 0, 5, 568446438);
+    d = gg(d, a, b, c, words[i + 14] | 0, 9, -1019803690);
+    c = gg(c, d, a, b, words[i + 3] | 0, 14, -187363961);
+    b = gg(b, c, d, a, words[i + 8] | 0, 20, 1163531501);
+    a = gg(a, b, c, d, words[i + 13] | 0, 5, -1444681467);
+    d = gg(d, a, b, c, words[i + 2] | 0, 9, -51403784);
+    c = gg(c, d, a, b, words[i + 7] | 0, 14, 1735328473);
+    b = gg(b, c, d, a, words[i + 12] | 0, 20, -1926607734);
+    a = hh(a, b, c, d, words[i + 5] | 0, 4, -378558);
+    d = hh(d, a, b, c, words[i + 8] | 0, 11, -2022574463);
+    c = hh(c, d, a, b, words[i + 11] | 0, 16, 1839030562);
+    b = hh(b, c, d, a, words[i + 14] | 0, 23, -35309556);
+    a = hh(a, b, c, d, words[i + 1] | 0, 4, -1530992060);
+    d = hh(d, a, b, c, words[i + 4] | 0, 11, 1272893353);
+    c = hh(c, d, a, b, words[i + 7] | 0, 16, -155497632);
+    b = hh(b, c, d, a, words[i + 10] | 0, 23, -1094730640);
+    a = hh(a, b, c, d, words[i + 13] | 0, 4, 681279174);
+    d = hh(d, a, b, c, words[i + 0] | 0, 11, -358537222);
+    c = hh(c, d, a, b, words[i + 3] | 0, 16, -722521979);
+    b = hh(b, c, d, a, words[i + 6] | 0, 23, 76029189);
+    a = hh(a, b, c, d, words[i + 9] | 0, 4, -640364487);
+    d = hh(d, a, b, c, words[i + 12] | 0, 11, -421815835);
+    c = hh(c, d, a, b, words[i + 15] | 0, 16, 530742520);
+    b = hh(b, c, d, a, words[i + 2] | 0, 23, -995338651);
+    a = ii(a, b, c, d, words[i + 0] | 0, 6, -198630844);
+    d = ii(d, a, b, c, words[i + 7] | 0, 10, 1126891415);
+    c = ii(c, d, a, b, words[i + 14] | 0, 15, -1416354905);
+    b = ii(b, c, d, a, words[i + 5] | 0, 21, -57434055);
+    a = ii(a, b, c, d, words[i + 12] | 0, 6, 1700485571);
+    d = ii(d, a, b, c, words[i + 3] | 0, 10, -1894986606);
+    c = ii(c, d, a, b, words[i + 10] | 0, 15, -1051523);
+    b = ii(b, c, d, a, words[i + 1] | 0, 21, -2054922799);
+    a = ii(a, b, c, d, words[i + 8] | 0, 6, 1873313359);
+    d = ii(d, a, b, c, words[i + 15] | 0, 10, -30611744);
+    c = ii(c, d, a, b, words[i + 6] | 0, 15, -1560198380);
+    b = ii(b, c, d, a, words[i + 13] | 0, 21, 1309151649);
+    a = ii(a, b, c, d, words[i + 4] | 0, 6, -145523070);
+    d = ii(d, a, b, c, words[i + 11] | 0, 10, -1120210379);
+    c = ii(c, d, a, b, words[i + 2] | 0, 15, 718787259);
+    b = ii(b, c, d, a, words[i + 9] | 0, 21, -343485551);
+    a = a + oa | 0;
+    b = b + ob | 0;
+    c = c + oc | 0;
+    d = d + od | 0;
+  }
+  return toHex(a) + toHex(b) + toHex(c) + toHex(d);
+}
+__name(md5, "md5");
+function add32(x, y) {
+  return x + y | 0;
+}
+__name(add32, "add32");
+function cmn(q, a, b, x, s, t) {
+  const n = add32(add32(a, q), add32(x, t));
+  return add32(n << s | n >>> 32 - s, b);
+}
+__name(cmn, "cmn");
+function ff(a, b, c, d, x, s, t) {
+  return cmn(b & c | ~b & d, a, b, x, s, t);
+}
+__name(ff, "ff");
+function gg(a, b, c, d, x, s, t) {
+  return cmn(b & d | c & ~d, a, b, x, s, t);
+}
+__name(gg, "gg");
+function hh(a, b, c, d, x, s, t) {
+  return cmn(b ^ c ^ d, a, b, x, s, t);
+}
+__name(hh, "hh");
+function ii(a, b, c, d, x, s, t) {
+  return cmn(c ^ (b | ~d), a, b, x, s, t);
+}
+__name(ii, "ii");
+function toHex(n) {
+  let s = "";
+  for (let i = 0; i < 4; i++) {
+    s += (n >> i * 8 & 255).toString(16).padStart(2, "0");
+  }
+  return s;
+}
+__name(toHex, "toHex");
 
-function getPrice(tld: string): number {
+// src/registrars/index.ts
+function makeRegistrar(env) {
+  const choice = (env.REGISTRAR || "opensrs").toLowerCase();
+  if (choice === "opensrs") {
+    if (!env.OPENSRS_USERNAME || !env.OPENSRS_KEY) return null;
+    return new OpenSRSRegistrar({
+      username: env.OPENSRS_USERNAME,
+      key: env.OPENSRS_KEY,
+      env: env.OPENSRS_ENV === "ote" ? "ote" : "live"
+    });
+  }
+  return null;
+}
+__name(makeRegistrar, "makeRegistrar");
+
+// src/index.ts
+var TLD_PRICING = {
+  ".com": 12.99,
+  ".net": 13.99,
+  ".org": 13.99,
+  ".io": 39.99,
+  ".ai": 69.99,
+  ".co": 15.99,
+  ".dev": 16.99,
+  ".app": 18.99,
+  ".me": 12.99,
+  ".xyz": 4.99,
+  ".tech": 9.99,
+  ".store": 8.99,
+  ".online": 7.99,
+  ".site": 6.99,
+  ".ro": 17.99,
+  ".eu": 9.99,
+  ".uk": 10.99,
+  ".de": 9.99
+};
+var SUPPORTED_TLDS = Object.keys(TLD_PRICING);
+function getPrice(tld) {
   return TLD_PRICING[tld] || 14.99;
 }
-
-function extractTld(domain: string): string {
+__name(getPrice, "getPrice");
+function extractTld(domain) {
   return "." + domain.split(".").slice(1).join(".");
 }
-
-// -----------------------------------------------------------------
-// Domains we know are taken (for demo/fallback before Porkbun API is wired)
-// -----------------------------------------------------------------
-const TAKEN = new Set([
-  "google.com", "facebook.com", "amazon.com", "apple.com", "microsoft.com",
-  "github.com", "openai.com", "anthropic.com", "cloudflare.com", "vercel.com",
-  "mcpdomain.ai", "example.com", "test.com", "claude.com",
+__name(extractTld, "extractTld");
+var TAKEN = /* @__PURE__ */ new Set([
+  "google.com",
+  "facebook.com",
+  "amazon.com",
+  "apple.com",
+  "microsoft.com",
+  "github.com",
+  "openai.com",
+  "anthropic.com",
+  "cloudflare.com",
+  "vercel.com",
+  "mcpdomain.ai",
+  "example.com",
+  "test.com",
+  "claude.com"
 ]);
-
-// -----------------------------------------------------------------
-// TOOL IMPLEMENTATIONS
-// -----------------------------------------------------------------
-function checkDomain(domain: string) {
+function checkDomain(domain) {
   const d = domain.toLowerCase().trim();
   const tld = extractTld(d);
   if (!SUPPORTED_TLDS.includes(tld)) {
@@ -74,26 +420,29 @@ function checkDomain(domain: string) {
   const available = !TAKEN.has(d);
   const price = getPrice(tld);
   return {
-    domain: d, available, tld,
+    domain: d,
+    available,
+    tld,
     price: available ? `$${price.toFixed(2)}/yr` : null,
     price_usd: available ? price : null,
-    currency: "USD", premium: false,
+    currency: "USD",
+    premium: false
   };
 }
-
-function suggestDomains(keywords: string, tlds: string[] = [".com", ".co", ".io"], maxResults = 8) {
+__name(checkDomain, "checkDomain");
+function suggestDomains(keywords, tlds = [".com", ".co", ".io"], maxResults = 8) {
   const words = keywords.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(Boolean);
   if (!words.length) return [];
-  const names = new Set<string>();
+  const names = /* @__PURE__ */ new Set();
   const base = words.join("");
   names.add(base);
   if (words.length >= 2) names.add(words.slice(0, 2).join(""));
   if (words.length === 1) names.add(words[0]);
-  ["get", "try", "my", "use", "go"].forEach(p => names.add(p + base));
-  ["app", "hq", "hub", "lab"].forEach(s => names.add(base + s));
-  const validTlds = tlds.filter(t => SUPPORTED_TLDS.includes(t));
+  ["get", "try", "my", "use", "go"].forEach((p) => names.add(p + base));
+  ["app", "hq", "hub", "lab"].forEach((s) => names.add(base + s));
+  const validTlds = tlds.filter((t) => SUPPORTED_TLDS.includes(t));
   if (!validTlds.length) validTlds.push(".com");
-  const results: any[] = [];
+  const results = [];
   for (const name of names) {
     if (results.length >= maxResults) break;
     for (const tld of validTlds) {
@@ -104,19 +453,20 @@ function suggestDomains(keywords: string, tlds: string[] = [".com", ".co", ".io"
         const lengthScore = Math.max(0, 100 - name.length * 3);
         const tldBonus = tld === ".com" ? 15 : tld === ".io" ? 10 : 5;
         results.push({
-          domain, available: true,
+          domain,
+          available: true,
           price: `$${getPrice(tld).toFixed(2)}/yr`,
           price_usd: getPrice(tld),
-          tld, relevance_score: Math.min(100, lengthScore + tldBonus),
+          tld,
+          relevance_score: Math.min(100, lengthScore + tldBonus)
         });
       }
     }
   }
   return results.sort((a, b) => b.relevance_score - a.relevance_score);
 }
-
-// Persist a new order to D1 and return the canonical result object for the tool call
-async function registerDomain(env: Env, domain: string, years: number, registrant: any) {
+__name(suggestDomains, "suggestDomains");
+async function registerDomain(env, domain, years, registrant) {
   const d = domain.toLowerCase().trim();
   if (TAKEN.has(d)) {
     return { error: "domain_not_available", message: `${d} is not available.` };
@@ -125,35 +475,33 @@ async function registerDomain(env: Env, domain: string, years: number, registran
   const pricePerYear = getPrice(tld);
   const totalPrice = pricePerYear * years;
   const orderId = `MCD-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-
-  // Check for an existing active order on the same domain
   const existing = await env.DB.prepare(
     `SELECT order_id, status FROM orders WHERE domain = ? AND status NOT IN ('failed', 'refunded', 'cancelled') ORDER BY created_at DESC LIMIT 1`
-  ).bind(d).first<{ order_id: string; status: string }>();
-
+  ).bind(d).first();
   if (existing) {
     return {
       error: "domain_already_ordered",
       message: `Another order exists for ${d} (order ${existing.order_id}, status ${existing.status}). Use a different domain or contact support.`,
       existing_order_id: existing.order_id,
-      existing_status: existing.status,
+      existing_status: existing.status
     };
   }
-
-  // Persist the new order
   await env.DB.prepare(
     `INSERT INTO orders (
       order_id, domain, years, price_usd, tld, status,
       registrant_first_name, registrant_last_name, registrant_email, registrant_country
     ) VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?)`
   ).bind(
-    orderId, d, years, totalPrice, tld,
+    orderId,
+    d,
+    years,
+    totalPrice,
+    tld,
     registrant?.first_name ?? null,
     registrant?.last_name ?? null,
     registrant?.email ?? null,
-    registrant?.country ?? null,
+    registrant?.country ?? null
   ).run();
-
   return {
     order_id: orderId,
     domain: d,
@@ -165,14 +513,14 @@ async function registerDomain(env: Env, domain: string, years: number, registran
     next_steps: [
       "1. Send user to checkout_url to complete payment",
       "2. After payment, domain is registered automatically with Porkbun",
-      "3. Offer email forwarding via configure_domain_email and DNS via configure_domain_dns",
+      "3. Offer email forwarding via configure_domain_email and DNS via configure_domain_dns"
     ],
-    included_free: ["Email forwarding", "Managed DNS", "AI bot intelligence", "WHOIS privacy"],
+    included_free: ["Email forwarding", "Managed DNS", "AI bot intelligence", "WHOIS privacy"]
   };
 }
-
-function configureEmail(domain: string, catchAllTo?: string, aliases?: {from: string; to: string}[]) {
-  const forwards: any[] = [];
+__name(registerDomain, "registerDomain");
+function configureEmail(domain, catchAllTo, aliases) {
+  const forwards = [];
   if (catchAllTo) forwards.push({ from: `*@${domain}`, to: catchAllTo, type: "catch_all", active: true });
   if (aliases) {
     for (const a of aliases) {
@@ -181,53 +529,54 @@ function configureEmail(domain: string, catchAllTo?: string, aliases?: {from: st
   }
   return { domain, status: "active", email_forwards: forwards, message: `Email forwarding active for ${domain}.` };
 }
-
-function configureDns(domain: string, records: any[]) {
-  const full = records.map((r: any) => ({ type: r.type, name: r.name, value: r.value, ttl: r.ttl || 3600, priority: r.priority }));
+__name(configureEmail, "configureEmail");
+function configureDns(domain, records) {
+  const full = records.map((r) => ({ type: r.type, name: r.name, value: r.value, ttl: r.ttl || 3600, priority: r.priority }));
   return { domain, status: "propagating", records: full, estimated_propagation: "5-30 minutes" };
 }
-
-function getDomainDetails(domain: string) {
+__name(configureDns, "configureDns");
+function getDomainDetails(domain) {
   const d = domain.toLowerCase();
   if (!TAKEN.has(d)) {
     return { error: "domain_not_found", message: `${d} is not registered with MCPDomain.`, suggestions: ["Use check_domain_availability to see if it's available"] };
   }
   const bots = [
-    { name: "GPTBot", requests: 847, last_seen: new Date().toISOString() },
-    { name: "ClaudeBot", requests: 623, last_seen: new Date().toISOString() },
-    { name: "Bytespider", requests: 312, last_seen: new Date(Date.now() - 86400000).toISOString() },
+    { name: "GPTBot", requests: 847, last_seen: (/* @__PURE__ */ new Date()).toISOString() },
+    { name: "ClaudeBot", requests: 623, last_seen: (/* @__PURE__ */ new Date()).toISOString() },
+    { name: "Bytespider", requests: 312, last_seen: new Date(Date.now() - 864e5).toISOString() }
   ];
   return {
-    domain: d, status: "active",
-    registered_at: new Date(Date.now() - 30 * 86400000).toISOString(),
-    expires_at: new Date(Date.now() + 335 * 86400000).toISOString(),
-    auto_renew: true, nameservers: ["ns1.mcpdomain.ai", "ns2.mcpdomain.ai"],
+    domain: d,
+    status: "active",
+    registered_at: new Date(Date.now() - 30 * 864e5).toISOString(),
+    expires_at: new Date(Date.now() + 335 * 864e5).toISOString(),
+    auto_renew: true,
+    nameservers: ["ns1.mcpdomain.ai", "ns2.mcpdomain.ai"],
     dns_records: [{ type: "NS", name: "@", value: "ns1.mcpdomain.ai", ttl: 86400 }],
     email_forwards: [],
-    ai_bot_intelligence: { total_requests_30d: bots.reduce((s, b) => s + b.requests, 0), unique_bots: bots.length, bots },
+    ai_bot_intelligence: { total_requests_30d: bots.reduce((s, b) => s + b.requests, 0), unique_bots: bots.length, bots }
   };
 }
-
-function transferDomain(domain: string, _authCode: string) {
+__name(getDomainDetails, "getDomainDetails");
+function transferDomain(domain, _authCode) {
   return {
     transfer_id: `TRF-${Date.now().toString(36).toUpperCase()}`,
-    domain: domain.toLowerCase(), status: "pending_approval", eta: "5-7 days",
-    included_after_transfer: ["1 year added to expiry", "Free email forwarding", "Managed DNS", "AI bot intelligence"],
+    domain: domain.toLowerCase(),
+    status: "pending_approval",
+    eta: "5-7 days",
+    included_after_transfer: ["1 year added to expiry", "Free email forwarding", "Managed DNS", "AI bot intelligence"]
   };
 }
-
-// -----------------------------------------------------------------
-// MCP TOOL DEFINITIONS
-// -----------------------------------------------------------------
-const TOOLS = [
+__name(transferDomain, "transferDomain");
+var TOOLS = [
   {
     name: "check_domain_availability",
     description: "Check whether a specific internet domain name is available for registration. Returns availability status, price, and alternatives if taken. WHEN TO USE: user asks 'is X.com available?' or 'can I register Y.io?'. ALWAYS call this before register_new_domain.",
     inputSchema: {
       type: "object",
       properties: { domain: { type: "string", description: "Complete domain name with TLD, e.g. 'sweetcrumbs.com'" } },
-      required: ["domain"],
-    },
+      required: ["domain"]
+    }
   },
   {
     name: "suggest_available_domains",
@@ -237,10 +586,10 @@ const TOOLS = [
       properties: {
         keywords: { type: "string", description: "Business name or description, e.g. 'sweet crumbs bakery'" },
         tlds: { type: "array", items: { type: "string" }, description: "TLDs to search. Default: ['.com','.co','.io']" },
-        max_results: { type: "number", description: "Max suggestions. Default: 8" },
+        max_results: { type: "number", description: "Max suggestions. Default: 8" }
       },
-      required: ["keywords"],
-    },
+      required: ["keywords"]
+    }
   },
   {
     name: "register_new_domain",
@@ -253,14 +602,16 @@ const TOOLS = [
         registrant: {
           type: "object",
           properties: {
-            first_name: { type: "string" }, last_name: { type: "string" },
-            email: { type: "string" }, country: { type: "string", description: "ISO 3166-1 alpha-2" },
+            first_name: { type: "string" },
+            last_name: { type: "string" },
+            email: { type: "string" },
+            country: { type: "string", description: "ISO 3166-1 alpha-2" }
           },
-          required: ["first_name", "last_name", "email"],
-        },
+          required: ["first_name", "last_name", "email"]
+        }
       },
-      required: ["domain", "registrant"],
-    },
+      required: ["domain", "registrant"]
+    }
   },
   {
     name: "configure_domain_email",
@@ -270,10 +621,10 @@ const TOOLS = [
       properties: {
         domain: { type: "string" },
         catch_all_to: { type: "string", description: "Forward ALL emails to this inbox" },
-        aliases: { type: "array", items: { type: "object", properties: { from: { type: "string" }, to: { type: "string" } }, required: ["from", "to"] } },
+        aliases: { type: "array", items: { type: "object", properties: { from: { type: "string" }, to: { type: "string" } }, required: ["from", "to"] } }
       },
-      required: ["domain"],
-    },
+      required: ["domain"]
+    }
   },
   {
     name: "configure_domain_dns",
@@ -282,10 +633,10 @@ const TOOLS = [
       type: "object",
       properties: {
         domain: { type: "string" },
-        records: { type: "array", items: { type: "object", properties: { type: { type: "string", enum: ["A","AAAA","CNAME","MX","TXT","SRV"] }, name: { type: "string" }, value: { type: "string" }, ttl: { type: "number" }, priority: { type: "number" } }, required: ["type","name","value"] } },
+        records: { type: "array", items: { type: "object", properties: { type: { type: "string", enum: ["A", "AAAA", "CNAME", "MX", "TXT", "SRV"] }, name: { type: "string" }, value: { type: "string" }, ttl: { type: "number" }, priority: { type: "number" } }, required: ["type", "name", "value"] } }
       },
-      required: ["domain", "records"],
-    },
+      required: ["domain", "records"]
+    }
   },
   {
     name: "get_my_domain_details",
@@ -293,8 +644,8 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { domain: { type: "string" } },
-      required: ["domain"],
-    },
+      required: ["domain"]
+    }
   },
   {
     name: "transfer_existing_domain",
@@ -302,65 +653,47 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: { domain: { type: "string" }, auth_code: { type: "string", description: "EPP code from current registrar" } },
-      required: ["domain", "auth_code"],
-    },
-  },
+      required: ["domain", "auth_code"]
+    }
+  }
 ];
-
-// -----------------------------------------------------------------
-// MCP PROTOCOL HANDLER
-// -----------------------------------------------------------------
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  id?: string | number;
-  method: string;
-  params?: any;
-}
-interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  id: string | number;
-  result?: any;
-  error?: { code: number; message: string; data?: any };
-}
-
-function handleInitialize(req: JsonRpcRequest): JsonRpcResponse {
+function handleInitialize(req) {
   return {
     jsonrpc: "2.0",
-    id: req.id!,
+    id: req.id,
     result: {
       protocolVersion: "2025-03-26",
       capabilities: { tools: {} },
       serverInfo: { name: "mcpdomain", version: "1.0.2" },
-      instructions: "MCPDomain is the first domain registrar built for AI agents. Use the 7 tools to check availability, register domains, configure email forwarding, and manage DNS - all inside the conversation.",
-    },
+      instructions: "MCPDomain is the first domain registrar built for AI agents. Use the 7 tools to check availability, register domains, configure email forwarding, and manage DNS - all inside the conversation."
+    }
   };
 }
-
-function handleToolsList(req: JsonRpcRequest): JsonRpcResponse {
-  return { jsonrpc: "2.0", id: req.id!, result: { tools: TOOLS } };
+__name(handleInitialize, "handleInitialize");
+function handleToolsList(req) {
+  return { jsonrpc: "2.0", id: req.id, result: { tools: TOOLS } };
 }
-
-async function handleToolCall(env: Env, req: JsonRpcRequest): Promise<JsonRpcResponse> {
+__name(handleToolsList, "handleToolsList");
+async function handleToolCall(env, req) {
   const { name, arguments: args } = req.params || {};
-  let result: any;
+  let result;
   try {
     switch (name) {
       case "check_domain_availability": {
         const check = checkDomain(args.domain);
-        let alternatives: any[] = [];
+        let alternatives = [];
         if (!check.error && !check.available) {
           const baseName = args.domain.split(".")[0];
-          alternatives = suggestDomains(baseName, [".com", ".co", ".io", ".ai"], 3)
-            .map(s => ({ domain: s.domain, price: s.price, tld: s.tld }));
+          alternatives = suggestDomains(baseName, [".com", ".co", ".io", ".ai"], 3).map((s) => ({ domain: s.domain, price: s.price, tld: s.tld }));
         }
-        result = { ...check, ...(alternatives.length > 0 && { alternatives_if_taken: alternatives }) };
+        result = { ...check, ...alternatives.length > 0 && { alternatives_if_taken: alternatives } };
         break;
       }
       case "suggest_available_domains":
         result = {
           query: args.keywords,
           results: suggestDomains(args.keywords, args.tlds, args.max_results),
-          next_action: "Present these to the user. When they pick one, call register_new_domain.",
+          next_action: "Present these to the user. When they pick one, call register_new_domain."
         };
         break;
       case "register_new_domain":
@@ -380,26 +713,29 @@ async function handleToolCall(env: Env, req: JsonRpcRequest): Promise<JsonRpcRes
         break;
       default:
         return {
-          jsonrpc: "2.0", id: req.id!,
-          error: { code: -32601, message: `Unknown tool: ${name}` },
+          jsonrpc: "2.0",
+          id: req.id,
+          error: { code: -32601, message: `Unknown tool: ${name}` }
         };
     }
-  } catch (e: any) {
+  } catch (e) {
     return {
-      jsonrpc: "2.0", id: req.id!,
-      error: { code: -32603, message: e.message || String(e) },
+      jsonrpc: "2.0",
+      id: req.id,
+      error: { code: -32603, message: e.message || String(e) }
     };
   }
   return {
-    jsonrpc: "2.0", id: req.id!,
+    jsonrpc: "2.0",
+    id: req.id,
     result: {
-      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-    },
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+    }
   };
 }
-
-async function handleJsonRpc(env: Env, req: JsonRpcRequest): Promise<JsonRpcResponse | null> {
-  if (req.id === undefined || req.id === null) return null;
+__name(handleToolCall, "handleToolCall");
+async function handleJsonRpc(env, req) {
+  if (req.id === void 0 || req.id === null) return null;
   switch (req.method) {
     case "initialize":
       return handleInitialize(req);
@@ -413,48 +749,29 @@ async function handleJsonRpc(env: Env, req: JsonRpcRequest): Promise<JsonRpcResp
       return { jsonrpc: "2.0", id: req.id, error: { code: -32601, message: `Method not found: ${req.method}` } };
   }
 }
-
-// -----------------------------------------------------------------
-// CHECKOUT PAGE (HTML)
-// -----------------------------------------------------------------
-interface OrderRow {
-  order_id: string;
-  domain: string;
-  years: number;
-  price_usd: number;
-  tld: string;
-  status: string;
-  registrant_first_name: string | null;
-  registrant_last_name: string | null;
-  registrant_email: string | null;
-  registrant_country: string | null;
-  created_at: string;
-  paid_at: string | null;
-  registered_at: string | null;
-}
-
-function escapeHtml(s: string): string {
+__name(handleJsonRpc, "handleJsonRpc");
+function escapeHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-
-function renderCheckoutPage(order: OrderRow, paymentParam?: string): string {
-  const name = [order.registrant_first_name, order.registrant_last_name].filter(Boolean).join(" ") || "—";
-  const email = order.registrant_email || "—";
-  const statusLabel: Record<string, string> = {
+__name(escapeHtml, "escapeHtml");
+function renderCheckoutPage(order, paymentParam) {
+  const name = [order.registrant_first_name, order.registrant_last_name].filter(Boolean).join(" ") || "\u2014";
+  const email = order.registrant_email || "\u2014";
+  const statusLabel = {
     pending_payment: "Awaiting payment",
     paid: "Payment received, registering domain",
     registered: "Domain registered",
     failed: "Registration failed",
     cancelled: "Cancelled",
-    refunded: "Refunded",
+    refunded: "Refunded"
   };
   const status = statusLabel[order.status] || order.status;
   const canPay = order.status === "pending_payment";
   let banner = "";
   if (paymentParam === "success") {
-    banner = `<div style="background:#D1FAE5;color:#065F46;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment received — we're registering your domain now. You'll get an email shortly.</div>`;
+    banner = `<div style="background:#D1FAE5;color:#065F46;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment received \u2014 we're registering your domain now. You'll get an email shortly.</div>`;
   } else if (paymentParam === "cancelled") {
-    banner = `<div style="background:#FEE2E2;color:#991B1B;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment cancelled. Your order is still open — click Pay to try again.</div>`;
+    banner = `<div style="background:#FEE2E2;color:#991B1B;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment cancelled. Your order is still open \u2014 click Pay to try again.</div>`;
   }
   return `<!DOCTYPE html>
 <html lang="en">
@@ -516,13 +833,10 @@ function renderCheckoutPage(order: OrderRow, paymentParam?: string): string {
           <span class="v">$${order.price_usd.toFixed(2)}</span>
         </div>
 
-        ${canPay
-          ? `<form method="POST" action="/api/checkout-session/${encodeURIComponent(order.order_id)}" style="margin:0">
+        ${canPay ? `<form method="POST" action="/api/checkout-session/${encodeURIComponent(order.order_id)}" style="margin:0">
                <button type="submit" class="btn">Pay $${order.price_usd.toFixed(2)} with Stripe</button>
              </form>
-             <p class="note">Secure checkout powered by Stripe. You'll be redirected to complete payment.<br>Test mode: card <code>4242 4242 4242 4242</code>, any future expiry, any CVC.</p>`
-          : `<p class="note">This order is ${escapeHtml(status.toLowerCase())}. Nothing to do here.</p>`
-        }
+             <p class="note">Secure checkout powered by Stripe. You'll be redirected to complete payment.<br>Test mode: card <code>4242 4242 4242 4242</code>, any future expiry, any CVC.</p>` : `<p class="note">This order is ${escapeHtml(status.toLowerCase())}. Nothing to do here.</p>`}
 
         <div class="included">
           <strong>Included free with your registration:</strong><br>
@@ -544,8 +858,8 @@ function renderCheckoutPage(order: OrderRow, paymentParam?: string): string {
 </body>
 </html>`;
 }
-
-function renderNotFoundPage(orderId: string): string {
+__name(renderCheckoutPage, "renderCheckoutPage");
+function renderNotFoundPage(orderId) {
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>Order not found - MCPDomain</title>
 <style>
@@ -562,34 +876,25 @@ function renderNotFoundPage(orderId: string): string {
   Otherwise, go back to <a href="https://mcpdomain.ai">mcpdomain.ai</a>.</p>
 </div></body></html>`;
 }
-
-async function handleCheckoutPage(env: Env, orderId: string, paymentParam?: string): Promise<Response> {
+__name(renderNotFoundPage, "renderNotFoundPage");
+async function handleCheckoutPage(env, orderId, paymentParam) {
   const order = await env.DB.prepare(
     `SELECT order_id, domain, years, price_usd, tld, status,
             registrant_first_name, registrant_last_name, registrant_email, registrant_country,
             created_at, paid_at, registered_at
      FROM orders WHERE order_id = ?`
-  ).bind(orderId).first<OrderRow>();
-
+  ).bind(orderId).first();
   const headers = { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" };
   if (!order) {
     return new Response(renderNotFoundPage(orderId), { status: 404, headers });
   }
   return new Response(renderCheckoutPage(order, paymentParam), { status: 200, headers });
 }
-
-// -----------------------------------------------------------------
-// STRIPE INTEGRATION
-// -----------------------------------------------------------------
-async function createStripeCheckoutSession(
-  env: Env,
-  order: OrderRow,
-  origin: string
-): Promise<{ id: string; url: string }> {
+__name(handleCheckoutPage, "handleCheckoutPage");
+async function createStripeCheckoutSession(env, order, origin) {
   const yearsLabel = order.years === 1 ? "1 year" : `${order.years} years`;
-  const productName = `${order.domain} — ${yearsLabel}`;
+  const productName = `${order.domain} \u2014 ${yearsLabel}`;
   const description = `Domain registration via MCPDomain. Includes email forwarding, managed DNS, WHOIS privacy, AI bot intelligence.`;
-
   const params = new URLSearchParams();
   params.append("mode", "payment");
   params.append("payment_method_types[0]", "card");
@@ -610,47 +915,38 @@ async function createStripeCheckoutSession(
   params.append("metadata[tld]", order.tld);
   params.append("payment_intent_data[metadata][order_id]", order.order_id);
   params.append("payment_intent_data[metadata][domain]", order.domain);
-
   const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Type": "application/x-www-form-urlencoded"
     },
-    body: params.toString(),
+    body: params.toString()
   });
-
   if (!resp.ok) {
     const errText = await resp.text();
     throw new Error(`Stripe ${resp.status}: ${errText}`);
   }
-
-  const data = (await resp.json()) as { id: string; url: string };
+  const data = await resp.json();
   if (!data.id || !data.url) {
     throw new Error(`Stripe response missing id/url: ${JSON.stringify(data)}`);
   }
   return data;
 }
-
-async function handleCreateCheckoutSession(
-  env: Env,
-  orderId: string,
-  request: Request
-): Promise<Response> {
+__name(createStripeCheckoutSession, "createStripeCheckoutSession");
+async function handleCreateCheckoutSession(env, orderId, request) {
   if (!env.STRIPE_SECRET_KEY) {
     return Response.json(
       { error: "stripe_not_configured", message: "STRIPE_SECRET_KEY not set on worker." },
       { status: 500 }
     );
   }
-
   const order = await env.DB.prepare(
     `SELECT order_id, domain, years, price_usd, tld, status,
             registrant_first_name, registrant_last_name, registrant_email, registrant_country,
             created_at, paid_at, registered_at
      FROM orders WHERE order_id = ? LIMIT 1`
-  ).bind(orderId).first<OrderRow>();
-
+  ).bind(orderId).first();
   if (!order) {
     return Response.json({ error: "order_not_found", order_id: orderId }, { status: 404 });
   }
@@ -660,44 +956,32 @@ async function handleCreateCheckoutSession(
         error: "order_not_payable",
         message: `Order status is ${order.status}, not pending_payment.`,
         order_id: orderId,
-        status: order.status,
+        status: order.status
       },
       { status: 409 }
     );
   }
-
   const url = new URL(request.url);
   const origin = `${url.protocol}//${url.host}`;
-
-  let session: { id: string; url: string };
+  let session;
   try {
     session = await createStripeCheckoutSession(env, order, origin);
-  } catch (err: any) {
+  } catch (err) {
     return Response.json(
       { error: "stripe_error", message: err?.message ?? String(err) },
       { status: 502 }
     );
   }
-
   await env.DB.prepare(
     `UPDATE orders SET stripe_session_id = ?, updated_at = datetime('now') WHERE order_id = ?`
   ).bind(session.id, orderId).run();
-
   return Response.redirect(session.url, 303);
 }
-
-// -----------------------------------------------------------------
-// STRIPE WEBHOOK
-// -----------------------------------------------------------------
-async function verifyStripeSignature(
-  payload: string,
-  signatureHeader: string,
-  secret: string
-): Promise<boolean> {
-  // Header format: t=<timestamp>,v1=<sig>,v1=<sig>,...
+__name(handleCreateCheckoutSession, "handleCreateCheckoutSession");
+async function verifyStripeSignature(payload, signatureHeader, secret) {
   const parts = signatureHeader.split(",");
   let timestamp = "";
-  const sigs: string[] = [];
+  const sigs = [];
   for (const part of parts) {
     const idx = part.indexOf("=");
     if (idx < 0) continue;
@@ -707,12 +991,9 @@ async function verifyStripeSignature(
     else if (k === "v1") sigs.push(v);
   }
   if (!timestamp || sigs.length === 0) return false;
-
-  // 5-minute tolerance
-  const now = Math.floor(Date.now() / 1000);
+  const now = Math.floor(Date.now() / 1e3);
   const ts = parseInt(timestamp, 10);
   if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) return false;
-
   const signedPayload = `${timestamp}.${payload}`;
   const key = await crypto.subtle.importKey(
     "raw",
@@ -722,10 +1003,7 @@ async function verifyStripeSignature(
     ["sign"]
   );
   const sigBytes = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signedPayload));
-  const expected = Array.from(new Uint8Array(sigBytes))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
+  const expected = Array.from(new Uint8Array(sigBytes)).map((b) => b.toString(16).padStart(2, "0")).join("");
   for (const s of sigs) {
     if (s.length !== expected.length) continue;
     let diff = 0;
@@ -734,34 +1012,21 @@ async function verifyStripeSignature(
   }
   return false;
 }
-
-// -----------------------------------------------------------------
-// POST-PAYMENT REGISTRAR CALL
-// -----------------------------------------------------------------
-/**
- * Runs inside ctx.waitUntil() after the webhook has already returned 200 to
- * Stripe. Loads the paid order from D1, calls the configured registrar's
- * registerDomain(), and writes the outcome back to the order row.
- *
- * We never throw from this function — Stripe has already been acknowledged,
- * and any error is surfaced via registrar_status='failed' + registrar_response.
- */
-async function registerAfterPayment(env: Env, orderId: string): Promise<void> {
+__name(verifyStripeSignature, "verifyStripeSignature");
+async function registerAfterPayment(env, orderId) {
   try {
     const registrar = makeRegistrar(env);
     if (!registrar) {
       console.error(`[${orderId}] no registrar configured; leaving order in 'paid' state`);
       return;
     }
-
     const order = await env.DB.prepare(
       `SELECT order_id, domain, years, status,
               registrant_first_name, registrant_last_name,
               registrant_email, registrant_country,
               registrar_status
          FROM orders WHERE order_id = ?`
-    ).bind(orderId).first<any>();
-
+    ).bind(orderId).first();
     if (!order) {
       console.error(`[${orderId}] order not found for post-payment registration`);
       return;
@@ -774,26 +1039,22 @@ async function registerAfterPayment(env: Env, orderId: string): Promise<void> {
       console.log(`[${orderId}] already registered; skipping`);
       return;
     }
-
-    // Mark attempt so a replayed webhook doesn't double-register.
     await env.DB.prepare(
       `UPDATE orders SET registrar_status = 'registering', updated_at = datetime('now')
         WHERE order_id = ? AND (registrar_status IS NULL OR registrar_status IN ('failed','pending'))`
     ).bind(orderId).run();
-
     const result = await registrar.registerDomain({
       domain: order.domain,
       years: order.years,
       registrant: {
         first_name: order.registrant_first_name || "Domain",
-        last_name:  order.registrant_last_name  || "Owner",
-        email:      order.registrant_email      || "admin@mcpdomain.ai",
-        country:    order.registrant_country    || "US",
+        last_name: order.registrant_last_name || "Owner",
+        email: order.registrant_email || "admin@mcpdomain.ai",
+        country: order.registrant_country || "US"
       },
       auto_renew: true,
-      privacy: true,
+      privacy: true
     });
-
     if (result.ok) {
       await env.DB.prepare(
         `UPDATE orders
@@ -807,8 +1068,8 @@ async function registerAfterPayment(env: Env, orderId: string): Promise<void> {
       ).bind(
         result.registrar_order_id ?? null,
         result.expires_at ?? null,
-        truncate(JSON.stringify({ ok: true, registrar: registrar.name, raw: result.raw }), 4000),
-        orderId,
+        truncate(JSON.stringify({ ok: true, registrar: registrar.name, raw: result.raw }), 4e3),
+        orderId
       ).run();
       console.log(`[${orderId}] registered ${order.domain} via ${registrar.name}`);
     } else {
@@ -820,16 +1081,18 @@ async function registerAfterPayment(env: Env, orderId: string): Promise<void> {
          WHERE order_id = ?`
       ).bind(
         truncate(JSON.stringify({
-          ok: false, registrar: registrar.name,
-          error_code: result.error_code, error_message: result.error_message,
-        }), 4000),
-        orderId,
+          ok: false,
+          registrar: registrar.name,
+          error_code: result.error_code,
+          error_message: result.error_message
+        }), 4e3),
+        orderId
       ).run();
       console.error(
         `[${orderId}] registration failed: ${result.error_code} ${result.error_message}`
       );
     }
-  } catch (err: any) {
+  } catch (err) {
     console.error(`[${orderId}] registerAfterPayment threw:`, err?.message ?? err);
     try {
       await env.DB.prepare(
@@ -839,24 +1102,20 @@ async function registerAfterPayment(env: Env, orderId: string): Promise<void> {
                updated_at = datetime('now')
          WHERE order_id = ?`
       ).bind(
-        truncate(JSON.stringify({ ok: false, exception: String(err?.message ?? err) }), 4000),
-        orderId,
+        truncate(JSON.stringify({ ok: false, exception: String(err?.message ?? err) }), 4e3),
+        orderId
       ).run();
-    } catch { /* swallow — we're already on the error path */ }
+    } catch {
+    }
   }
 }
-
-function truncate(s: string, n: number): string {
+__name(registerAfterPayment, "registerAfterPayment");
+function truncate(s, n) {
   return s.length > n ? s.slice(0, n) : s;
 }
-
-async function handleStripeWebhook(
-  env: Env,
-  ctx: ExecutionContext,
-  request: Request,
-): Promise<Response> {
+__name(truncate, "truncate");
+async function handleStripeWebhook(env, ctx, request) {
   const rawBody = await request.text();
-
   if (env.STRIPE_WEBHOOK_SECRET) {
     const sigHeader = request.headers.get("stripe-signature");
     if (!sigHeader) {
@@ -867,22 +1126,17 @@ async function handleStripeWebhook(
       return new Response("Invalid signature", { status: 400 });
     }
   }
-  // If STRIPE_WEBHOOK_SECRET is not set, we accept unverified payloads (dev only).
-
-  let event: any;
+  let event;
   try {
     event = JSON.parse(rawBody);
   } catch {
     return new Response("Bad JSON", { status: 400 });
   }
-
   try {
     if (event.type === "checkout.session.completed") {
       const session = event.data?.object ?? {};
-      const orderId: string | undefined =
-        session.metadata?.order_id || session.client_reference_id;
-      const paymentIntent: string | null =
-        typeof session.payment_intent === "string" ? session.payment_intent : null;
+      const orderId = session.metadata?.order_id || session.client_reference_id;
+      const paymentIntent = typeof session.payment_intent === "string" ? session.payment_intent : null;
       if (orderId) {
         await env.DB.prepare(
           `UPDATE orders
@@ -892,19 +1146,11 @@ async function handleStripeWebhook(
                  updated_at = datetime('now')
            WHERE order_id = ? AND status = 'pending_payment'`
         ).bind(paymentIntent, orderId).run();
-
-        // Kick off domain registration in the background so we can return 200
-        // to Stripe immediately. Any registration failure is persisted to the
-        // order row (registrar_status/registrar_response) for later retry.
         ctx.waitUntil(registerAfterPayment(env, orderId));
       }
-    } else if (
-      event.type === "checkout.session.expired" ||
-      event.type === "checkout.session.async_payment_failed"
-    ) {
+    } else if (event.type === "checkout.session.expired" || event.type === "checkout.session.async_payment_failed") {
       const session = event.data?.object ?? {};
-      const orderId: string | undefined =
-        session.metadata?.order_id || session.client_reference_id;
+      const orderId = session.metadata?.order_id || session.client_reference_id;
       if (orderId) {
         await env.DB.prepare(
           `UPDATE orders
@@ -914,27 +1160,22 @@ async function handleStripeWebhook(
         ).bind(`stripe:${event.type}`, orderId).run();
       }
     }
-  } catch (err: any) {
+  } catch (err) {
     console.error("Webhook handler error:", err?.message ?? err);
   }
-
   return Response.json({ received: true }, { status: 200 });
 }
-
-// -----------------------------------------------------------------
-// CORS + LLMS.TXT
-// -----------------------------------------------------------------
-const CORS_HEADERS: Record<string, string> = {
+__name(handleStripeWebhook, "handleStripeWebhook");
+var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version",
-  "Access-Control-Expose-Headers": "Mcp-Session-Id",
+  "Access-Control-Expose-Headers": "Mcp-Session-Id"
 };
-
-const LLMS_TXT = `# MCPDomain
+var LLMS_TXT = `# MCPDomain
 
 The first domain registrar built for AI agents. Check availability, register domains,
-configure email forwarding and DNS — all from inside any AI conversation via the
+configure email forwarding and DNS \u2014 all from inside any AI conversation via the
 Model Context Protocol (MCP).
 
 ## MCP endpoint
@@ -955,31 +1196,22 @@ https://mcpdomain.ai/mcp  (Streamable HTTP, JSON-RPC 2.0)
 - npm:      https://www.npmjs.com/package/mcpdomain
 - Smithery: https://smithery.ai/server/danboabes/mcpdomain
 `;
-
-// -----------------------------------------------------------------
-// FETCH HANDLER (Worker entry)
-// -----------------------------------------------------------------
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+var index_default = {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
-
     if (method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
-
-    // Checkout page
     if (path.startsWith("/checkout/") && method === "GET") {
       const orderId = decodeURIComponent(path.slice("/checkout/".length));
       if (!orderId) {
         return Response.json({ error: "Missing order ID" }, { status: 400, headers: CORS_HEADERS });
       }
-      const paymentParam = url.searchParams.get("payment") || undefined;
+      const paymentParam = url.searchParams.get("payment") || void 0;
       return handleCheckoutPage(env, orderId, paymentParam);
     }
-
-    // Create Stripe Checkout Session (form submit from checkout page)
     if (path.startsWith("/api/checkout-session/") && method === "POST") {
       const orderId = decodeURIComponent(path.slice("/api/checkout-session/".length));
       if (!orderId) {
@@ -987,28 +1219,20 @@ export default {
       }
       return handleCreateCheckoutSession(env, orderId, request);
     }
-
-    // Stripe webhook
     if (path === "/api/stripe-webhook" && method === "POST") {
       return handleStripeWebhook(env, ctx, request);
     }
-
-    // Health check
     if (path === "/health" || path === "/") {
       return Response.json(
         { status: "ok", name: "mcpdomain", version: "1.0.2", tools: 7, tlds: SUPPORTED_TLDS.length },
         { headers: CORS_HEADERS }
       );
     }
-
-    // llms.txt
     if (path === "/llms.txt") {
       return new Response(LLMS_TXT, {
-        headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8" },
+        headers: { ...CORS_HEADERS, "Content-Type": "text/plain; charset=utf-8" }
       });
     }
-
-    // MCP endpoint
     if (path === "/mcp") {
       if (method === "GET") {
         return Response.json(
@@ -1020,7 +1244,7 @@ export default {
         return new Response(null, { status: 204, headers: CORS_HEADERS });
       }
       if (method === "POST") {
-        let body: any;
+        let body;
         try {
           body = await request.json();
         } catch {
@@ -1029,34 +1253,33 @@ export default {
             { status: 400, headers: { ...CORS_HEADERS, "Content-Type": "application/json" } }
           );
         }
-
         if (Array.isArray(body)) {
-          const responses = (
-            await Promise.all(body.map((req: JsonRpcRequest) => handleJsonRpc(env, req)))
-          ).filter((r): r is JsonRpcResponse => r !== null);
+          const responses = (await Promise.all(body.map((req) => handleJsonRpc(env, req)))).filter((r) => r !== null);
           if (responses.length === 0) {
             return new Response(null, { status: 204, headers: CORS_HEADERS });
           }
           return Response.json(responses, {
-            headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
+            headers: { ...CORS_HEADERS, "Content-Type": "application/json" }
           });
         }
-
         const response = await handleJsonRpc(env, body);
         if (response === null) {
           return new Response(null, { status: 204, headers: CORS_HEADERS });
         }
-        const headers: Record<string, string> = { ...CORS_HEADERS, "Content-Type": "application/json" };
+        const headers = { ...CORS_HEADERS, "Content-Type": "application/json" };
         if (body.method === "initialize") {
           headers["Mcp-Session-Id"] = crypto.randomUUID();
         }
         return Response.json(response, { headers });
       }
     }
-
     return Response.json(
       { error: "Not found", path },
       { status: 404, headers: CORS_HEADERS }
     );
-  },
+  }
 };
+export {
+  index_default as default
+};
+//# sourceMappingURL=index.js.map
