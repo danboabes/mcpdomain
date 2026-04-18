@@ -958,7 +958,7 @@ footer {
   <div class="section-eyebrow">Connect</div>
   <h2 class="section-title">Three ways to <em>plug it in</em>.</h2>
   <p class="section-sub">
-    Use the hosted version (zero install) or run locally with stdio. Works with Claude Desktop, Claude Code, Cursor, Cline, and any MCP-compatible client.
+    Use the hosted version (zero install) or run locally with stdio. Works with Claude Desktop, Claude Code, Cursor, Cline, OpenClaw, and any MCP-compatible client.
   </p>
 
   <div class="install-grid">
@@ -1048,6 +1048,23 @@ npx @smithery/cli install mcpdomain</div>
     <span class="punct">}</span>
   <span class="punct">}</span>
 <span class="punct">}</span></div>
+    </div>
+
+    <!-- OpenClaw / McPorter -->
+    <div class="install-card">
+      <div class="install-header">
+        <div class="install-logo">🦞</div>
+        <div>
+          <div class="install-name">OpenClaw / McPorter</div>
+          <div class="install-tag">mcporter install</div>
+        </div>
+      </div>
+      <div class="code-block">
+<button class="copy-btn" onclick="copyCode(this)">Copy</button>
+<span class="comment"># One-line install into OpenClaw:</span>
+npm install -g mcporter
+mcporter install mcpdomain <span class="punct">\</span>
+  --<span class="punct"> </span>target openclaw</div>
     </div>
 
     <!-- Self-host -->
