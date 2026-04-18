@@ -5,12 +5,15 @@
  * Deployed at https://mcpdomain.ai/mcp
  *
  * Routes:
- *   POST /mcp                 - MCP JSON-RPC endpoint (7 tools)
- *   GET  /health              - health check
- *   GET  /llms.txt            - AI-readable site description
- *   GET  /checkout/:orderId   - HTML checkout page for a pending order
+ *   POST /mcp                          - MCP JSON-RPC endpoint (7 tools)
+ *   GET  /health                       - health check
+ *   GET  /llms.txt                     - AI-readable site description
+ *   GET  /checkout/:orderId            - HTML checkout page for a pending order
+ *   POST /api/checkout-session/:orderId - Create Stripe Checkout Session + 303 redirect
+ *   POST /api/stripe-webhook           - Stripe event receiver (checkout.session.completed)
  *
  * Persistence: Cloudflare D1 binding env.DB (database: mcpdomain-orders)
+ * Secrets: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET (via wrangler secret put)
  */
 
 // -----------------------------------------------------------------
@@ -18,6 +21,8 @@
 // -----------------------------------------------------------------
 interface Env {
   DB: D1Database;
+  STRIPE_SECRET_KEY: string;
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 // -----------------------------------------------------------------
@@ -424,7 +429,7 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function renderCheckoutPage(order: OrderRow): string {
+function renderCheckoutPage(order: OrderRow, paymentParam?: string): string {
   const name = [order.registrant_first_name, order.registrant_last_name].filter(Boolean).join(" ") || "—";
   const email = order.registrant_email || "—";
   const statusLabel: Record<string, string> = {
@@ -437,6 +442,12 @@ function renderCheckoutPage(order: OrderRow): string {
   };
   const status = statusLabel[order.status] || order.status;
   const canPay = order.status === "pending_payment";
+  let banner = "";
+  if (paymentParam === "success") {
+    banner = `<div style="background:#D1FAE5;color:#065F46;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment received — we're registering your domain now. You'll get an email shortly.</div>`;
+  } else if (paymentParam === "cancelled") {
+    banner = `<div style="background:#FEE2E2;color:#991B1B;padding:14px 16px;border-radius:10px;margin-bottom:20px;font-size:14px;font-weight:600;">Payment cancelled. Your order is still open — click Pay to try again.</div>`;
+  }
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -482,6 +493,7 @@ function renderCheckoutPage(order: OrderRow): string {
         <div class="sub">Order ${escapeHtml(order.order_id)}</div>
       </div>
       <div class="body">
+        ${banner}
         <p class="domain">${escapeHtml(order.domain)}</p>
         <span class="status ${escapeHtml(order.status)}">${escapeHtml(status)}</span>
 
@@ -497,8 +509,10 @@ function renderCheckoutPage(order: OrderRow): string {
         </div>
 
         ${canPay
-          ? `<button class="btn disabled" disabled>Pay with Stripe - coming soon</button>
-             <p class="note">Payment integration is being finalized. Your order is saved - reply to the AI conversation that created this order, or email <a href="mailto:hello@mcpdomain.ai" style="color:#6B1D1D">hello@mcpdomain.ai</a> to complete registration manually.</p>`
+          ? `<form method="POST" action="/api/checkout-session/${encodeURIComponent(order.order_id)}" style="margin:0">
+               <button type="submit" class="btn">Pay $${order.price_usd.toFixed(2)} with Stripe</button>
+             </form>
+             <p class="note">Secure checkout powered by Stripe. You'll be redirected to complete payment.<br>Test mode: card <code>4242 4242 4242 4242</code>, any future expiry, any CVC.</p>`
           : `<p class="note">This order is ${escapeHtml(status.toLowerCase())}. Nothing to do here.</p>`
         }
 
@@ -541,7 +555,7 @@ function renderNotFoundPage(orderId: string): string {
 </div></body></html>`;
 }
 
-async function handleCheckoutPage(env: Env, orderId: string): Promise<Response> {
+async function handleCheckoutPage(env: Env, orderId: string, paymentParam?: string): Promise<Response> {
   const order = await env.DB.prepare(
     `SELECT order_id, domain, years, price_usd, tld, status,
             registrant_first_name, registrant_last_name, registrant_email, registrant_country,
@@ -553,45 +567,265 @@ async function handleCheckoutPage(env: Env, orderId: string): Promise<Response> 
   if (!order) {
     return new Response(renderNotFoundPage(orderId), { status: 404, headers });
   }
-  return new Response(renderCheckoutPage(order), { status: 200, headers });
+  return new Response(renderCheckoutPage(order, paymentParam), { status: 200, headers });
 }
 
 // -----------------------------------------------------------------
-// CORS + CONTENT
+// STRIPE INTEGRATION
 // -----------------------------------------------------------------
-const CORS_HEADERS = {
+async function createStripeCheckoutSession(
+  env: Env,
+  order: OrderRow,
+  origin: string
+): Promise<{ id: string; url: string }> {
+  const yearsLabel = order.years === 1 ? "1 year" : `${order.years} years`;
+  const productName = `${order.domain} — ${yearsLabel}`;
+  const description = `Domain registration via MCPDomain. Includes email forwarding, managed DNS, WHOIS privacy, AI bot intelligence.`;
+
+  const params = new URLSearchParams();
+  params.append("mode", "payment");
+  params.append("payment_method_types[0]", "card");
+  params.append("line_items[0][price_data][currency]", "usd");
+  params.append("line_items[0][price_data][product_data][name]", productName);
+  params.append("line_items[0][price_data][product_data][description]", description);
+  params.append("line_items[0][price_data][unit_amount]", String(Math.round(order.price_usd * 100)));
+  params.append("line_items[0][quantity]", "1");
+  if (order.registrant_email) {
+    params.append("customer_email", order.registrant_email);
+  }
+  params.append("success_url", `${origin}/checkout/${order.order_id}?payment=success`);
+  params.append("cancel_url", `${origin}/checkout/${order.order_id}?payment=cancelled`);
+  params.append("client_reference_id", order.order_id);
+  params.append("metadata[order_id]", order.order_id);
+  params.append("metadata[domain]", order.domain);
+  params.append("metadata[years]", String(order.years));
+  params.append("metadata[tld]", order.tld);
+  params.append("payment_intent_data[metadata][order_id]", order.order_id);
+  params.append("payment_intent_data[metadata][domain]", order.domain);
+
+  const resp = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.STRIPE_SECRET_KEY}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params.toString(),
+  });
+
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`Stripe ${resp.status}: ${errText}`);
+  }
+
+  const data = (await resp.json()) as { id: string; url: string };
+  if (!data.id || !data.url) {
+    throw new Error(`Stripe response missing id/url: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+async function handleCreateCheckoutSession(
+  env: Env,
+  orderId: string,
+  request: Request
+): Promise<Response> {
+  if (!env.STRIPE_SECRET_KEY) {
+    return Response.json(
+      { error: "stripe_not_configured", message: "STRIPE_SECRET_KEY not set on worker." },
+      { status: 500 }
+    );
+  }
+
+  const order = await env.DB.prepare(
+    `SELECT order_id, domain, years, price_usd, tld, status,
+            registrant_first_name, registrant_last_name, registrant_email, registrant_country,
+            created_at, paid_at, registered_at
+     FROM orders WHERE order_id = ? LIMIT 1`
+  ).bind(orderId).first<OrderRow>();
+
+  if (!order) {
+    return Response.json({ error: "order_not_found", order_id: orderId }, { status: 404 });
+  }
+  if (order.status !== "pending_payment") {
+    return Response.json(
+      {
+        error: "order_not_payable",
+        message: `Order status is ${order.status}, not pending_payment.`,
+        order_id: orderId,
+        status: order.status,
+      },
+      { status: 409 }
+    );
+  }
+
+  const url = new URL(request.url);
+  const origin = `${url.protocol}//${url.host}`;
+
+  let session: { id: string; url: string };
+  try {
+    session = await createStripeCheckoutSession(env, order, origin);
+  } catch (err: any) {
+    return Response.json(
+      { error: "stripe_error", message: err?.message ?? String(err) },
+      { status: 502 }
+    );
+  }
+
+  await env.DB.prepare(
+    `UPDATE orders SET stripe_session_id = ?, updated_at = datetime('now') WHERE order_id = ?`
+  ).bind(session.id, orderId).run();
+
+  return Response.redirect(session.url, 303);
+}
+
+// -----------------------------------------------------------------
+// STRIPE WEBHOOK
+// -----------------------------------------------------------------
+async function verifyStripeSignature(
+  payload: string,
+  signatureHeader: string,
+  secret: string
+): Promise<boolean> {
+  // Header format: t=<timestamp>,v1=<sig>,v1=<sig>,...
+  const parts = signatureHeader.split(",");
+  let timestamp = "";
+  const sigs: string[] = [];
+  for (const part of parts) {
+    const idx = part.indexOf("=");
+    if (idx < 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (k === "t") timestamp = v;
+    else if (k === "v1") sigs.push(v);
+  }
+  if (!timestamp || sigs.length === 0) return false;
+
+  // 5-minute tolerance
+  const now = Math.floor(Date.now() / 1000);
+  const ts = parseInt(timestamp, 10);
+  if (!Number.isFinite(ts) || Math.abs(now - ts) > 300) return false;
+
+  const signedPayload = `${timestamp}.${payload}`;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sigBytes = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(signedPayload));
+  const expected = Array.from(new Uint8Array(sigBytes))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  for (const s of sigs) {
+    if (s.length !== expected.length) continue;
+    let diff = 0;
+    for (let i = 0; i < s.length; i++) diff |= s.charCodeAt(i) ^ expected.charCodeAt(i);
+    if (diff === 0) return true;
+  }
+  return false;
+}
+
+async function handleStripeWebhook(env: Env, request: Request): Promise<Response> {
+  const rawBody = await request.text();
+
+  if (env.STRIPE_WEBHOOK_SECRET) {
+    const sigHeader = request.headers.get("stripe-signature");
+    if (!sigHeader) {
+      return new Response("Missing stripe-signature header", { status: 400 });
+    }
+    const ok = await verifyStripeSignature(rawBody, sigHeader, env.STRIPE_WEBHOOK_SECRET);
+    if (!ok) {
+      return new Response("Invalid signature", { status: 400 });
+    }
+  }
+  // If STRIPE_WEBHOOK_SECRET is not set, we accept unverified payloads (dev only).
+
+  let event: any;
+  try {
+    event = JSON.parse(rawBody);
+  } catch {
+    return new Response("Bad JSON", { status: 400 });
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data?.object ?? {};
+      const orderId: string | undefined =
+        session.metadata?.order_id || session.client_reference_id;
+      const paymentIntent: string | null =
+        typeof session.payment_intent === "string" ? session.payment_intent : null;
+      if (orderId) {
+        await env.DB.prepare(
+          `UPDATE orders
+             SET status = 'paid',
+                 paid_at = datetime('now'),
+                 stripe_payment_intent = COALESCE(?, stripe_payment_intent),
+                 updated_at = datetime('now')
+           WHERE order_id = ? AND status = 'pending_payment'`
+        ).bind(paymentIntent, orderId).run();
+      }
+    } else if (
+      event.type === "checkout.session.expired" ||
+      event.type === "checkout.session.async_payment_failed"
+    ) {
+      const session = event.data?.object ?? {};
+      const orderId: string | undefined =
+        session.metadata?.order_id || session.client_reference_id;
+      if (orderId) {
+        await env.DB.prepare(
+          `UPDATE orders
+             SET updated_at = datetime('now'),
+                 notes = COALESCE(notes || ' | ', '') || ?
+           WHERE order_id = ?`
+        ).bind(`stripe:${event.type}`, orderId).run();
+      }
+    }
+  } catch (err: any) {
+    console.error("Webhook handler error:", err?.message ?? err);
+  }
+
+  return Response.json({ received: true }, { status: 200 });
+}
+
+// -----------------------------------------------------------------
+// CORS + LLMS.TXT
+// -----------------------------------------------------------------
+const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Mcp-Session-Id, Accept",
+  "Access-Control-Allow-Headers": "Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version",
   "Access-Control-Expose-Headers": "Mcp-Session-Id",
 };
 
 const LLMS_TXT = `# MCPDomain
-> The first domain registrar built for AI agents.
 
-MCPDomain provides 7 MCP tools that let AI assistants check domain availability, register domains, configure email forwarding, and manage DNS - all within a single conversation.
+The first domain registrar built for AI agents. Check availability, register domains,
+configure email forwarding and DNS — all from inside any AI conversation via the
+Model Context Protocol (MCP).
 
-## MCP Endpoint
-https://mcpdomain.ai/mcp (Streamable HTTP transport)
+## MCP endpoint
+https://mcpdomain.ai/mcp  (Streamable HTTP, JSON-RPC 2.0)
 
 ## Tools
-- check_domain_availability: Check if a domain is available. Returns price and alternatives.
-- suggest_available_domains: Generate domain ideas from keywords with real-time availability.
-- register_new_domain: Register a domain. Returns Stripe checkout URL.
-- configure_domain_email: Set up email forwarding to Gmail/Outlook.
-- configure_domain_dns: Add DNS records (A, CNAME, MX, TXT).
-- get_my_domain_details: Domain status + AI bot crawling intelligence.
-- transfer_existing_domain: Transfer from GoDaddy/Namecheap/etc.
+- check_domain_availability
+- suggest_available_domains
+- register_new_domain
+- configure_domain_email
+- configure_domain_dns
+- get_my_domain_details
+- transfer_existing_domain
 
-## Install
-npx mcpdomain
-
-## Website
-https://mcpdomain.ai
+## Links
+- Homepage: https://mcpdomain.ai
+- GitHub:   https://github.com/danboabes/mcpdomain
+- npm:      https://www.npmjs.com/package/mcpdomain
+- Smithery: https://smithery.ai/server/danboabes/mcpdomain
 `;
 
 // -----------------------------------------------------------------
-// FETCH HANDLER
+// FETCH HANDLER (Worker entry)
 // -----------------------------------------------------------------
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -609,7 +843,22 @@ export default {
       if (!orderId) {
         return Response.json({ error: "Missing order ID" }, { status: 400, headers: CORS_HEADERS });
       }
-      return handleCheckoutPage(env, orderId);
+      const paymentParam = url.searchParams.get("payment") || undefined;
+      return handleCheckoutPage(env, orderId, paymentParam);
+    }
+
+    // Create Stripe Checkout Session (form submit from checkout page)
+    if (path.startsWith("/api/checkout-session/") && method === "POST") {
+      const orderId = decodeURIComponent(path.slice("/api/checkout-session/".length));
+      if (!orderId) {
+        return Response.json({ error: "Missing order ID" }, { status: 400, headers: CORS_HEADERS });
+      }
+      return handleCreateCheckoutSession(env, orderId, request);
+    }
+
+    // Stripe webhook
+    if (path === "/api/stripe-webhook" && method === "POST") {
+      return handleStripeWebhook(env, request);
     }
 
     // Health check
