@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-11-25/server.schema.json",
   "name": "io.github.danboabes/mcpdomain",
   "description": "The first domain registrar built for AI agents. Check availability, suggest names, register domains, configure email forwarding, and manage DNS — all through MCP tools that AI assistants can call directly inside conversations.",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "title": "MCPDomain",
   "homepage": "https://mcpdomain.ai",
   "license": "MIT",
@@ -30,8 +30,8 @@
   "packages": [
     {
       "registryName": "npm",
-      "name": "mcpdomain-mcp",
-      "version": "1.0.0",
+      "name": "mcpdomain",
+      "version": "1.0.5",
       "runtimeHint": "node",
       "transport": {
         "type": "stdio"

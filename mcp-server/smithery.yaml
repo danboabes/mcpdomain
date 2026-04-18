@@ -55,7 +55,7 @@ startCommand:
   commandFunction: |
     (config) => ({
       command: "npx",
-      args: ["-y", "mcpdomain-mcp"],
+      args: ["-y", "mcpdomain"],
       env: {
         OPENSRS_MODE: config.mode || "mock",
         OPENSRS_USERNAME: config.opensrsUsername || "",
