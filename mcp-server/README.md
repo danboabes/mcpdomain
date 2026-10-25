@@ -8,7 +8,7 @@ website, no DNS dashboard, no email-hosting setup. Powered by
 [Model Context Protocol](https://modelcontextprotocol.io) server.
 
 [![npm version](https://img.shields.io/npm/v/mcpdomain.svg)](https://www.npmjs.com/package/mcpdomain)
-[![Smithery](https://smithery.ai/badge/danboabes/mcpdomain)](https://smithery.ai/servers/danboabes/mcpdomain)
+[![LightNow capabilities](https://lightnow.ai/badge/io.github.danboabes/mcpdomain)](https://lightnow.ai/servers/io.github.danboabes/mcpdomain)
 [![license](https://img.shields.io/npm/l/mcpdomain.svg)](https://github.com/danboabes/mcpdomain/blob/main/LICENSE)
 
 ---
